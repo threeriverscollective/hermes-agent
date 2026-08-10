@@ -49,6 +49,44 @@ _SECRET_SOURCE_VALUES_BY_HOME: dict[str, dict[str, str]] = {}
 # config re-parse, and the ASCII sanitization sweep still ran every time.
 _APPLIED_HOMES: set[str] = set()
 
+# These values are inherited from the dispatcher after it has atomically
+# claimed a task and selected its profile.  A profile/user dotenv file is
+# configuration, not an authority channel, and must not be able to replace
+# the exact worker identity or protected permit handles selected by the
+# dispatcher.
+_INHERITED_WORKER_IDENTITY_KEYS = frozenset(
+    {
+        "HCP_PRE_MODEL_PERMIT_REQUIRED",
+        "HCP_PRE_MODEL_PERMIT_ROOT_FD",
+        "HCP_PRE_MODEL_PERMIT_SOCKET",
+        "HCP_PRE_MODEL_PERMIT_MANIFEST_FD",
+        "HCP_PRE_MODEL_PERMIT_PEER_PRIVATE_KEY_FD",
+        "HCP_PRE_MODEL_PERMIT_SERVER_PUBLIC_KEY_FD",
+        "HERMES_KANBAN_TASK",
+        "HERMES_KANBAN_RUN_ID",
+        "HERMES_KANBAN_CLAIM_LOCK",
+        "HERMES_KANBAN_BOARD",
+        "HERMES_KANBAN_DB",
+        "HERMES_PROFILE",
+    }
+)
+
+
+def _inherited_worker_identity() -> dict[str, str | None]:
+    """Snapshot dispatcher-selected identity already present in the process."""
+
+    return {key: os.environ.get(key) for key in _INHERITED_WORKER_IDENTITY_KEYS}
+
+
+def _restore_inherited_worker_identity(identity: dict[str, str | None]) -> None:
+    """Restore identity values that configuration loaders may not replace."""
+
+    for key, value in identity.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+
 
 def get_secret_source(env_var: str) -> str | None:
     """Return the label of the secret source that supplied ``env_var``, if any.
@@ -173,10 +211,14 @@ def _sanitize_loaded_credentials() -> None:
 
 
 def _load_dotenv_with_fallback(path: Path, *, override: bool) -> None:
+    inherited_identity = _inherited_worker_identity()
     try:
-        load_dotenv(dotenv_path=path, override=override, encoding="utf-8")
-    except UnicodeDecodeError:
-        load_dotenv(dotenv_path=path, override=override, encoding="latin-1")
+        try:
+            load_dotenv(dotenv_path=path, override=override, encoding="utf-8")
+        except UnicodeDecodeError:
+            load_dotenv(dotenv_path=path, override=override, encoding="latin-1")
+    finally:
+        _restore_inherited_worker_identity(inherited_identity)
     # Strip non-ASCII characters from credential env vars that were just
     # loaded.  API keys must be pure ASCII since they're sent as HTTP
     # header values (httpx encodes headers as ASCII).  Non-ASCII chars
@@ -312,6 +354,7 @@ def load_hermes_dotenv(
     - if no user env exists, the project `.env` also overrides stale shell vars.
     """
     loaded: list[Path] = []
+    inherited_identity = _inherited_worker_identity()
 
     home_path = Path(hermes_home or os.getenv("HERMES_HOME", Path.home() / ".hermes"))
     user_env = home_path / ".env"
@@ -346,7 +389,9 @@ def load_hermes_dotenv(
         loaded.append(project_env_path)
 
     _apply_external_secret_sources(home_path)
+    _restore_inherited_worker_identity(inherited_identity)
     _apply_managed_env()
+    _restore_inherited_worker_identity(inherited_identity)
 
     return loaded
 

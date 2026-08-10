@@ -6599,17 +6599,31 @@ class AIAgent:
         # which may be observed from another thread.
         with scoped_runtime_main({}):
             try:
-                return run_conversation(
-                    self,
-                    user_message,
-                    system_message,
-                    conversation_history,
-                    task_id,
-                    stream_callback,
-                    persist_user_message,
-                    persist_user_timestamp=persist_user_timestamp,
-                    moa_config=moa_config,
-                )
+                try:
+                    return run_conversation(
+                        self,
+                        user_message,
+                        system_message,
+                        conversation_history,
+                        task_id,
+                        stream_callback,
+                        persist_user_message,
+                        persist_user_timestamp=persist_user_timestamp,
+                        moa_config=moa_config,
+                    )
+                except BaseException as exc:
+                    from hermes_cli.provider_request_guard import (
+                        ProviderRequestBlocked,
+                    )
+
+                    if not isinstance(exc, ProviderRequestBlocked):
+                        raise
+                    from hermes_cli.kanban_db import record_provider_guard_hold
+
+                    hold = record_provider_guard_hold(exc.error_code)
+                    if hold is None:
+                        raise
+                    return hold
             finally:
                 reset_accounting_context(acct_token)
                 reset_conversation_context(token)

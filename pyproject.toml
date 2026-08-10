@@ -325,6 +325,7 @@ include = ["agent", "agent.*", "tools", "tools.*", "hermes_cli", "hermes_cli.*",
 # topic-setup image disappears. Loaded via Path(__file__).parent / "assets"
 # in gateway/status_phrases.py and gateway/run.py.
 gateway = ["assets/**/*"]
+"plugins.hcp_post_claim_pre_model_permit" = ["plugin.yaml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

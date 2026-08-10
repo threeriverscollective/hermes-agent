@@ -113,6 +113,17 @@ from utils import base_url_host_matches, base_url_hostname, env_float, model_for
 logger = logging.getLogger(__name__)
 
 
+def _refuse_managed_auxiliary_model_request() -> None:
+    """Keep managed worker model calls on the guarded main request route."""
+
+    from hermes_cli.plugins import provider_request_guard_required
+
+    if provider_request_guard_required():
+        from hermes_cli.provider_request_guard import ProviderRequestBlocked
+
+        raise ProviderRequestBlocked("PROVIDER_REQUEST_GUARD_AUXILIARY_DISABLED")
+
+
 # ── resolve_provider_client fall-through dedup ───────────────────────────
 # Both fall-through warning sites in resolve_provider_client (the "unknown
 # provider" and "unhandled auth_type" branches) fire on every retry of a
@@ -4705,6 +4716,8 @@ def resolve_provider_client(
     Returns:
         (client, resolved_model) or (None, None) if auth is unavailable.
     """
+    if not raw_codex:
+        _refuse_managed_auxiliary_model_request()
     _validate_proxy_env_urls()
     # Preserve the original provider name before alias normalization so a
     # user-declared ``custom_providers`` entry whose name coincidentally
@@ -5421,6 +5434,7 @@ def get_text_auxiliary_client(
     Callers may override the returned model via config.yaml
     (e.g. auxiliary.compression.model, auxiliary.web_extract.model).
     """
+    _refuse_managed_auxiliary_model_request()
     provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(task or None)
     return resolve_provider_client(
         provider,
@@ -5439,6 +5453,7 @@ def get_async_text_auxiliary_client(task: str = "", *, main_runtime: Optional[Di
     (AsyncCodexAuxiliaryClient, model) which wraps the Responses API.
     Returns (None, None) when no provider is available.
     """
+    _refuse_managed_auxiliary_model_request()
     provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(task or None)
     return resolve_provider_client(
         provider,
@@ -5576,6 +5591,7 @@ def resolve_vision_provider_client(
     backends, so users can intentionally force experimental providers. Auto mode
     stays conservative and only tries vision backends known to work today.
     """
+    _refuse_managed_auxiliary_model_request()
     runtime = _normalize_main_runtime(main_runtime)
     requested, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         "vision", provider, model, base_url, api_key
@@ -6109,6 +6125,7 @@ def _get_cached_client(
     preventing the fd-exhaustion that previously occurred in long-running
     gateways where recycled worker threads created unbounded entries (#10200).
     """
+    _refuse_managed_auxiliary_model_request()
     # Resolve the current event loop for async clients so we can validate
     # cached entries.  Loop identity is NOT in the cache key — instead we
     # check at hit time whether the cached loop is still current and open.
@@ -6960,6 +6977,7 @@ def call_llm(
     Raises:
         RuntimeError: If no provider is configured.
     """
+    _refuse_managed_auxiliary_model_request()
     # Capture one immutable runtime snapshot for keying, resolution, retries,
     # and fallbacks. Reading ambient state independently in each phase lets a
     # concurrent /model switch produce a key for one runtime and a client for
@@ -7593,6 +7611,7 @@ async def async_call_llm(
 
     Same as call_llm() but async. See call_llm() for full documentation.
     """
+    _refuse_managed_auxiliary_model_request()
     # Keep every async phase on the same runtime identity, even if another
     # session switches models while this task is awaiting network I/O.
     main_runtime = _normalize_main_runtime(main_runtime)

@@ -385,6 +385,15 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
     interrupt, abort, cancellation, and close semantics stay in the callers —
     this helper only issues the request.
     """
+    from hermes_cli.plugins import provider_request_guard_active
+
+    guard_active = provider_request_guard_active()
+    if guard_active and (
+        agent.api_mode != "chat_completions" or agent.provider == "moa"
+    ):
+        from hermes_cli.provider_request_guard import ProviderRequestBlocked
+
+        raise ProviderRequestBlocked("PROVIDER_REQUEST_ROUTE_UNSUPPORTED")
     if agent.api_mode == "codex_responses":
         request_client = make_client("codex_stream_request")
         return agent._run_codex_stream(
@@ -428,7 +437,74 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
         # in-process MoAClient facade. Do not rebuild a request-local
         # OpenAI client from the virtual runtime metadata.
         return agent.client.chat.completions.create(**api_kwargs)
+    # Construct the exact request-local client before consuming a short-lived
+    # permit. Its base URL, headers, query, and credential can then be checked
+    # and bound before the guard runs immediately ahead of provider I/O.
     request_client = make_client("chat_completion_request")
+    from hermes_cli.plugins import enforce_provider_request_guard
+    from hermes_cli.provider_request_guard import (
+        ProviderRequestBlocked,
+        canonical_model_request,
+        canonical_sdk_request,
+        client_transport_identity,
+        ensure_authorization_current,
+    )
+
+    if guard_active:
+        context = getattr(agent, "_provider_request_guard_context", None)
+        if not isinstance(context, dict):
+            raise ProviderRequestBlocked("PROVIDER_REQUEST_CONTEXT_UNAVAILABLE")
+        if any(api_kwargs.get(key) for key in ("extra_headers", "extra_query")):
+            raise ProviderRequestBlocked(
+                "PROVIDER_REQUEST_TRANSPORT_UNSUPPORTED"
+            )
+        if any(
+            key.startswith("__hermes_") or key.startswith("__bedrock_")
+            for key in api_kwargs
+        ):
+            raise ProviderRequestBlocked("PROVIDER_REQUEST_ROUTE_UNSUPPORTED")
+        sdk_request = canonical_sdk_request(api_kwargs)
+        wire_request = canonical_model_request(sdk_request)
+        endpoint, transport_identity_sha256 = client_transport_identity(
+            request_client,
+            expected_base_url=agent.base_url,
+            expected_api_key=agent.api_key,
+        )
+        token_fields = [
+            wire_request[key]
+            for key in ("max_completion_tokens", "max_tokens")
+            if key in wire_request
+        ]
+        if (
+            len(token_fields) != 1
+            or type(token_fields[0]) is not int
+            or token_fields[0] <= 0
+        ):
+            raise ProviderRequestBlocked(
+                "PROVIDER_REQUEST_MODEL_BUDGET_UNBOUNDED"
+            )
+        token_limit = token_fields[0]
+        authorization = enforce_provider_request_guard(
+            request=wire_request,
+            **context,
+            endpoint_origin=endpoint,
+            transport_identity_sha256=transport_identity_sha256,
+            transport_mode="non_streaming",
+            model_tokens_requested=token_limit,
+        )
+        # Use the independently canonicalized values that HCP just verified,
+        # while preserving only SDK-local controls that are not part of the
+        # JSON model body. The exact authorized nested request therefore cannot
+        # drift between permit consumption and provider transport.
+        api_kwargs = {
+            **{
+                key: value
+                for key, value in api_kwargs.items()
+                if key in {"timeout", "http_client"}
+            },
+            **sdk_request,
+        }
+        ensure_authorization_current(authorization)
     return request_client.chat.completions.create(**api_kwargs)
 
 
@@ -595,6 +671,8 @@ def interruptible_api_call(agent, api_kwargs: dict):
         else:
             agent._close_request_openai_client(request_client, reason=reason)
 
+    from hermes_cli.provider_request_guard import ProviderRequestBlocked
+
     def _call():
         try:
             # _set_request_client registers each per-request client with the
@@ -614,6 +692,12 @@ def interruptible_api_call(agent, api_kwargs: dict):
                     kind=kind,
                 ),
             )
+        except ProviderRequestBlocked as e:
+            # ProviderRequestBlocked deliberately derives from BaseException
+            # so ordinary provider retry/fallback handlers cannot consume it.
+            # Preserve that exact refusal across this transport worker thread;
+            # the owning conversation frame converts it to a neutral hold.
+            result["error"] = e
         except Exception as e:
             # If the request was cancelled by the main thread's interrupt
             # handler, the transport error is the expected consequence of our
@@ -1902,6 +1986,19 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
 
 def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
     """Request a summary when max iterations are reached. Returns the final response text."""
+    # This legacy helper calls provider clients directly instead of passing
+    # through the conversation loop's provider-request guard.  In a managed
+    # HCP run, terminate locally rather than create an unguarded model request.
+    from hermes_cli.plugins import provider_request_guard_required
+
+    if provider_request_guard_required():
+        final_response = (
+            f"I reached the maximum iterations ({agent.max_iterations}); "
+            "the managed run ended without an additional model request."
+        )
+        messages.append({"role": "assistant", "content": final_response})
+        return final_response
+
     print(f"⚠️  Reached maximum iterations ({agent.max_iterations}). Requesting summary...")
 
     summary_request = (

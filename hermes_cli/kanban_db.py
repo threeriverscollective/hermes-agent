@@ -3760,7 +3760,7 @@ def recompute_ready(
     promoted = 0
     with write_txn(conn):
         todo_rows = conn.execute(
-            "SELECT id, status, consecutive_failures, max_retries "
+            "SELECT id, status, consecutive_failures, max_retries, block_kind "
             "FROM tasks WHERE status IN ('todo', 'blocked')"
         ).fetchall()
         for row in todo_rows:
@@ -3771,6 +3771,14 @@ def recompute_ready(
                 # silently auto-recover.  ``unblock_task`` is the only
                 # legitimate exit (it emits ``"unblocked"`` which flips
                 # this predicate back).
+                continue
+            if (
+                cur_status == "blocked"
+                and row["block_kind"] == "provider_guard_integrity"
+            ):
+                # Cryptographic, replay, or identity failures require an
+                # explicit operator correction; dependency recomputation must
+                # never silently put that exact claim back on the run queue.
                 continue
             parents = conn.execute(
                 "SELECT t.status FROM tasks t "
@@ -5420,6 +5428,199 @@ def block_task(
         reason=reason,
     )
     return True
+
+
+_NEUTRAL_PROVIDER_GUARD_CODES = frozenset(
+    {
+        "AUTHORITY_UNAVAILABLE",
+        "AUTHORITY_CHANGED",
+        "BINDING_NOT_COMMITTED",
+        "CARD_NOT_SCHEDULABLE",
+        "BINDING_INVALID",
+        "DEPENDENCIES_STALE",
+        "COLLISION_PRESENT",
+        "SCOPE_STALE",
+        "PROFILE_STALE",
+        "CAPABILITY_MISMATCH",
+        "REVOKED",
+        "PROFILE_NOT_ALLOWED",
+        "BUDGET_INVALID",
+        "MODEL_BUDGET_INVALID",
+        "MODEL_BUDGET_EXCEEDED",
+        "PERMIT_NOT_ACTIVE",
+        "PERMIT_EXPIRED",
+        "NONCE_REPLAY",
+        "SIGNING_FAILED",
+        "HCP_PERMIT_CHANNEL_UNAVAILABLE",
+        "HCP_PERMIT_CHANNEL_TIMEOUT",
+        "HCP_PERMIT_CHANNEL_FAILED",
+        "PROVIDER_REQUEST_GUARD_UNAVAILABLE",
+    }
+)
+
+
+def _provider_guard_hold_kind(error_code: str) -> str:
+    return "neutral" if error_code in _NEUTRAL_PROVIDER_GUARD_CODES else "integrity"
+
+
+def _record_provider_guard_hold_for_claim(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    run_id: int,
+    claim_lock: str,
+    profile_id: str,
+    error_code: str,
+) -> Optional[dict[str, Any]]:
+    """Atomically park one exact claim without charging a worker failure."""
+
+    hold_kind = _provider_guard_hold_kind(error_code)
+    neutral = hold_kind == "neutral"
+    block_kind = "transient" if neutral else "provider_guard_integrity"
+    reason = f"hcp_pre_model_permit:{error_code}"
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, assignee, current_run_id, claim_lock, "
+            "consecutive_failures FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if (
+            row is None
+            or row["status"] != "running"
+            or row["assignee"] != profile_id
+            or row["current_run_id"] != run_id
+            or row["claim_lock"] != claim_lock
+        ):
+            return None
+        current_failures = int(row["consecutive_failures"] or 0)
+        updated = conn.execute(
+            "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL, block_kind = ?, "
+            "last_failure_error = ? WHERE id = ? AND status = 'running' "
+            "AND current_run_id = ? AND claim_lock = ?",
+            (block_kind, reason, task_id, run_id, claim_lock),
+        )
+        if updated.rowcount != 1:
+            return None
+        ended_run = _end_run(
+            conn,
+            task_id,
+            outcome="blocked",
+            status="blocked",
+            summary=reason,
+            metadata={
+                "provider_guard_hold": True,
+                "provider_guard_hold_kind": hold_kind,
+                "error_code": error_code,
+            },
+        )
+        if ended_run != run_id:
+            raise RuntimeError("provider guard run identity changed")
+        after_failures = conn.execute(
+            "SELECT consecutive_failures FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if (
+            after_failures is None
+            or int(after_failures["consecutive_failures"] or 0)
+            != current_failures
+        ):
+            raise RuntimeError("provider guard hold charged a failure")
+        _append_event(
+            conn,
+            task_id,
+            "provider_guard_hold",
+            {"error_code": error_code, "neutral": neutral, "hold_kind": hold_kind},
+            run_id=run_id,
+        )
+    result = {
+        "final_response": "",
+        "messages": [],
+        "api_calls": 0,
+        "completed": False,
+        "failed": False,
+        "neutral_hold": neutral,
+        "failure_reason": "neutral_hold" if neutral else "integrity_hold",
+        "error": error_code,
+    }
+    if not neutral:
+        result["integrity_hold"] = True
+    return result
+
+
+def record_claimed_provider_guard_hold(
+    conn: sqlite3.Connection,
+    task: Task,
+    error_code: str,
+) -> Optional[dict[str, Any]]:
+    """Park an exact dispatcher-owned claim before a worker is spawned."""
+
+    if (
+        type(error_code) is not str
+        or re.fullmatch(r"[A-Z][A-Z0-9_]{0,127}", error_code) is None
+        or task.current_run_id is None
+        or not task.claim_lock
+        or not task.assignee
+    ):
+        return None
+    return _record_provider_guard_hold_for_claim(
+        conn,
+        task_id=task.id,
+        run_id=task.current_run_id,
+        claim_lock=task.claim_lock,
+        profile_id=task.assignee,
+        error_code=error_code,
+    )
+
+
+def record_provider_guard_hold(error_code: str) -> Optional[dict[str, Any]]:
+    """Park the exact current worker after a pre-model permit refusal."""
+    if (
+        type(error_code) is not str
+        or re.fullmatch(r"[A-Z][A-Z0-9_]{0,127}", error_code) is None
+    ):
+        return None
+    task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
+    run_text = os.environ.get("HERMES_KANBAN_RUN_ID", "").strip()
+    claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK", "")
+    profile_id = os.environ.get("HERMES_PROFILE", "").strip()
+    board = os.environ.get("HERMES_KANBAN_BOARD", "").strip()
+    db_text = os.environ.get("HERMES_KANBAN_DB", "").strip()
+    if (
+        not task_id
+        or not run_text.isdecimal()
+        or int(run_text) <= 0
+        or not claim_lock
+        or not profile_id
+        or not board
+        or not db_text
+        or not os.path.isabs(db_text)
+    ):
+        return None
+    db_path = Path(db_text)
+    try:
+        before = db_path.stat()
+    except OSError:
+        return None
+    if not db_path.is_file():
+        return None
+
+    try:
+        with connect(db_path) as conn:
+            result = _record_provider_guard_hold_for_claim(
+                conn,
+                task_id=task_id,
+                run_id=int(run_text),
+                claim_lock=claim_lock,
+                profile_id=profile_id,
+                error_code=error_code,
+            )
+        after = db_path.stat()
+    except (OSError, sqlite3.Error, RuntimeError):
+        return None
+    if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+        return None
+    return result
 
 
 
@@ -8151,6 +8352,8 @@ def _dispatch_once_locked(
                 _per_profile_running[claimed.assignee] = (
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )
+        except ProviderGuardSpawnBlocked as exc:
+            record_claimed_provider_guard_hold(conn, claimed, exc.error_code)
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
@@ -8232,6 +8435,8 @@ def _dispatch_once_locked(
                 _set_worker_pid(conn, claimed.id, int(pid))
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             spawned += 1
+        except ProviderGuardSpawnBlocked as exc:
+            record_claimed_provider_guard_hold(conn, claimed, exc.error_code)
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
@@ -8504,6 +8709,120 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
         return None
 
 
+class ProviderGuardSpawnBlocked(RuntimeError):
+    """Exact pre-spawn permit input refusal that must not charge a retry."""
+
+    def __init__(self, error_code: str) -> None:
+        self.error_code = error_code
+        super().__init__(error_code)
+
+
+def _hcp_worker_input_stem(task_id: str) -> str:
+    """Derive a path-safe capability name from one exact Hermes task."""
+    if (
+        type(task_id) is not str
+        or not task_id
+        or task_id != task_id.strip()
+        or any(ord(char) < 0x20 for char in task_id)
+    ):
+        raise ProviderGuardSpawnBlocked("HCP_PERMIT_IDENTITY_INVALID")
+    return hashlib.sha256(task_id.encode("utf-8")).hexdigest()
+
+
+def _hcp_open_worker_input(root_fd: int, name: str) -> int:
+    """Open one host-owned, immutable worker input without following links."""
+    import fcntl
+    import stat
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd: int | None = None
+    try:
+        fd = os.open(name, flags, dir_fd=root_fd)
+        info = os.fstat(fd)
+        access = fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or stat.S_IMODE(info.st_mode) != 0o400
+            or access != os.O_RDONLY
+        ):
+            raise OSError("worker input is not a protected read-only file")
+        return fd
+    except OSError as exc:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        raise ProviderGuardSpawnBlocked("HCP_PERMIT_WORKER_INPUT_INVALID") from exc
+
+
+def _hcp_provider_guard_pass_fds(
+    env: dict[str, str], task: Task
+) -> tuple[int, ...]:
+    """Select exact task/run capabilities for one claimed worker process."""
+    import fcntl
+    import stat
+
+    root_text = env.get("HCP_PRE_MODEL_PERMIT_ROOT_FD", "").strip()
+    socket_path = env.get("HCP_PRE_MODEL_PERMIT_SOCKET", "").strip()
+    requested = bool(
+        root_text
+        or socket_path
+        or env.get("HCP_PRE_MODEL_PERMIT_REQUIRED", "").strip()
+    )
+    if not requested:
+        return ()
+    if (
+        _IS_WINDOWS
+        or not root_text.isdecimal()
+        or not socket_path
+        or not os.path.isabs(socket_path)
+        or task.current_run_id is None
+    ):
+        raise ProviderGuardSpawnBlocked("HCP_PERMIT_WORKER_INPUT_INVALID")
+    root_fd = int(root_text)
+    if root_fd < 3:
+        raise ProviderGuardSpawnBlocked("HCP_PERMIT_WORKER_INPUT_INVALID")
+    try:
+        root_info = os.fstat(root_fd)
+        root_access = fcntl.fcntl(root_fd, fcntl.F_GETFL) & os.O_ACCMODE
+    except OSError as exc:
+        raise ProviderGuardSpawnBlocked("HCP_PERMIT_WORKER_INPUT_INVALID") from exc
+    root_mode = stat.S_IMODE(root_info.st_mode)
+    if (
+        not stat.S_ISDIR(root_info.st_mode)
+        or root_info.st_uid != os.geteuid()
+        or root_mode not in {0o500, 0o700}
+        or root_access != os.O_RDONLY
+    ):
+        raise ProviderGuardSpawnBlocked("HCP_PERMIT_WORKER_INPUT_INVALID")
+
+    stem = _hcp_worker_input_stem(task.id)
+    names = (
+        f"{stem}.manifest.json",
+        f"{stem}.peer.ed25519",
+        "server.ed25519.pub",
+    )
+    opened: list[int] = []
+    try:
+        for name in names:
+            opened.append(_hcp_open_worker_input(root_fd, name))
+    except Exception:
+        for fd in opened:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        raise
+    env.pop("HCP_PRE_MODEL_PERMIT_ROOT_FD", None)
+    env["HCP_PRE_MODEL_PERMIT_REQUIRED"] = "1"
+    env["HCP_PRE_MODEL_PERMIT_MANIFEST_FD"] = str(opened[0])
+    env["HCP_PRE_MODEL_PERMIT_PEER_PRIVATE_KEY_FD"] = str(opened[1])
+    env["HCP_PRE_MODEL_PERMIT_SERVER_PUBLIC_KEY_FD"] = str(opened[2])
+    return tuple(opened)
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
@@ -8669,22 +8988,38 @@ def _default_spawn(
     # Use 'a' so a re-run on unblock appends rather than overwrites.
     log_f = open(log_path, "ab")
     try:
-        proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
-            cmd,
-            cwd=workspace if os.path.isdir(workspace) else None,
-            stdin=subprocess.DEVNULL,
-            stdout=log_f,
-            stderr=subprocess.STDOUT,
-            env=env,
-            start_new_session=True,
-            creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
-        )
+        popen_kwargs = {
+            "cwd": workspace if os.path.isdir(workspace) else None,
+            "stdin": subprocess.DEVNULL,
+            "stdout": log_f,
+            "stderr": subprocess.STDOUT,
+            "env": env,
+            "start_new_session": True,
+            "creationflags": subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
+        }
+        permit_fds = _hcp_provider_guard_pass_fds(env, task)
+        if permit_fds:
+            popen_kwargs["pass_fds"] = permit_fds
+        try:
+            proc = subprocess.Popen(  # noqa: S603 -- fixed argv built above
+                cmd,
+                **popen_kwargs,
+            )
+        finally:
+            for permit_fd in permit_fds:
+                try:
+                    os.close(permit_fd)
+                except OSError:
+                    pass
     except FileNotFoundError:
         log_f.close()
         raise RuntimeError(
             "`hermes` executable not found on PATH. "
             "Install Hermes Agent or activate its venv before running the kanban dispatcher."
         )
+    except Exception:
+        log_f.close()
+        raise
     # NOTE: we intentionally do NOT close log_f here — we want Popen's
     # child process to keep writing after this function returns.  The
     # handle is kept alive by the child's inheritance.  The parent's

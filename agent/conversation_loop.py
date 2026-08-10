@@ -710,6 +710,32 @@ def run_conversation(
         except Exception:
             pass
 
+    # HCP-managed workers use one narrowly supported provider route. Features
+    # that can perform an auxiliary model call before the main transport must
+    # never get a chance to bypass the post-claim permit boundary. The HCP
+    # profile binds these features off; changed configuration is a typed stop.
+    from hermes_cli.plugins import (
+        get_plugin_manager as _get_plugin_manager,
+        provider_request_guard_required as _provider_guard_required,
+    )
+    from hermes_cli.provider_request_guard import ProviderRequestBlocked
+
+    if _provider_guard_required():
+        _manager = _get_plugin_manager()
+        if (
+            agent.compression_enabled
+            or agent.api_mode != "chat_completions"
+            or agent.provider == "moa"
+            or env_var_enabled("HERMES_KANBAN_GOAL_MODE")
+            or _manager.has_hook("pre_llm_call")
+            or _manager.has_hook("pre_api_request")
+            or _manager.has_middleware("llm_request")
+            or _manager.has_middleware("llm_execution")
+        ):
+            raise ProviderRequestBlocked(
+                "PROVIDER_REQUEST_GUARD_ROUTE_UNSUPPORTED"
+            )
+
     # ── Per-turn setup (the prologue) ──
     # All once-per-turn setup — stdio guarding, retry-counter resets, user
     # message sanitization, todo/nudge hydration, system-prompt restore-or-
@@ -1607,6 +1633,17 @@ def run_conversation(
                     if isinstance(getattr(agent, "client", None), Mock):
                         _use_streaming = False
 
+                # The HCP permit is consumed for one exact, complete model
+                # request immediately before transport. Hermes' streaming
+                # helper may transparently retry inside one outer call, so a
+                # managed run always uses the single-attempt non-stream path;
+                # any outer retry re-enters the guard and consumes a fresh
+                # permit.
+                from hermes_cli.plugins import provider_request_guard_active
+
+                if provider_request_guard_active():
+                    _use_streaming = False
+
                 def _perform_api_call(next_api_kwargs):
                     if agent.api_mode == "codex_responses":
                         next_api_kwargs = agent._get_transport().preflight_kwargs(
@@ -1614,6 +1651,30 @@ def run_conversation(
                             allow_stream=False,
                             is_github_responses=agent._is_copilot_url(),
                         )
+                    if provider_request_guard_active():
+                        _managed_task_id = (
+                            os.environ.get("HERMES_KANBAN_TASK", "").strip()
+                            or effective_task_id
+                        )
+                        _profile_id = os.environ.get("HERMES_PROFILE", "").strip()
+                        if not _profile_id:
+                            try:
+                                from hermes_cli.profiles import get_active_profile_name
+
+                                _profile_id = get_active_profile_name()
+                            except Exception:
+                                _profile_id = "default"
+                        agent._provider_request_guard_context = {
+                            "task_id": _managed_task_id,
+                            "turn_id": turn_id,
+                            "api_request_id": api_request_id,
+                            "session_id": agent.session_id or "",
+                            "profile_id": _profile_id,
+                            "provider": agent.provider,
+                            "model": agent.model,
+                            "api_mode": agent.api_mode,
+                            "api_call_count": api_call_count,
+                        }
                     if _use_streaming:
                         return agent._interruptible_streaming_api_call(
                             next_api_kwargs, on_first_delta=_stop_spinner
