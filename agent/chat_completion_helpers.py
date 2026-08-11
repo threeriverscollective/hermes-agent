@@ -612,12 +612,17 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
         # permission for another provider call. Retry once with the exact same
         # immutable result. All typed refusals other than transport failure and
         # a second unknown outcome remain fatal.
+        retryable_completion_outcomes = {
+            "PROVIDER_REQUEST_COMPLETION_FAILED",
+            "HCP_PERMIT_CHANNEL_FAILED",
+            "HCP_PERMIT_CHANNEL_TIMEOUT",
+        }
         for completion_index in range(2):
             try:
                 complete_provider_request_guard(result=result)
             except ProviderRequestBlocked as exc:
                 if (
-                    exc.error_code != "PROVIDER_REQUEST_COMPLETION_FAILED"
+                    exc.error_code not in retryable_completion_outcomes
                     or completion_index == 1
                 ):
                     raise

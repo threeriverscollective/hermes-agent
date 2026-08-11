@@ -1495,9 +1495,11 @@ def test_lost_completion_ack_retries_only_the_same_consumed_attempt(
 
     class _LostAckGuard(_CompletingGuard):
         def complete_provider_attempt(self, *, result):
+            from hermes_cli.provider_request_guard import ProviderRequestBlocked
+
             self.results.append(result)
             if len(self.results) == 1:
-                raise OSError("completion acknowledgment lost")
+                raise ProviderRequestBlocked("HCP_PERMIT_CHANNEL_FAILED")
             return ProviderAttemptAcknowledgment(
                 authorization_id=result.authorization_id,
                 request_sha256=result.request_sha256,
