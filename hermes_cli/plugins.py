@@ -56,7 +56,7 @@ from hermes_cli.middleware import OBSERVER_SCHEMA_VERSION, VALID_MIDDLEWARE
 
 _HCP_PROVIDER_GUARD_PLUGIN = "hcp_post_claim_pre_model_permit"
 _HCP_PROVIDER_GUARD_FILES: dict[str, str] = {
-    "__init__.py": "e67502adf624b9617fcb00df8f5cd93ea75d29cee18eabf40bc39dfdb1d505ad",
+    "__init__.py": "d61d236f07639a05b09b448d3487fd462908e46b722df39711e7b3dc29707701",
     "channel.py": "a2c4ab14149bdabd6d1b8dce03d7ad3a37ff25d6c0e44f3faf27f08f76e75f50",
     "plugin.yaml": "b5a44bb3cdef47559b7b533dd8bf1671861e572b52bb2003eba539fae6282d5c",
 }
@@ -1292,6 +1292,10 @@ class PluginManager:
         self._middleware: Dict[str, List[Callable]] = {}
         self._provider_request_guard: Optional[Callable] = None
         self._provider_request_guard_owner: Optional[str] = None
+        self._provider_request_authorizations: Set[str] = set()
+        self._provider_request_completions: Set[str] = set()
+        self._provider_request_completion_inputs: Dict[str, object] = {}
+        self._provider_request_guard_lock = threading.Lock()
         self.__provider_guard_registration_capability = object()
         self._provider_request_guard_required = bool(
             os.environ.get("HCP_PRE_MODEL_PERMIT_SOCKET")
@@ -1342,6 +1346,9 @@ class PluginManager:
             self._middleware.clear()
             self._provider_request_guard = None
             self._provider_request_guard_owner = None
+            self._provider_request_authorizations.clear()
+            self._provider_request_completions.clear()
+            self._provider_request_completion_inputs.clear()
             self._plugin_tool_names.clear()
             self._plugin_platform_names.clear()
             self._cli_commands.clear()
@@ -2133,6 +2140,8 @@ class PluginManager:
             if self._provider_request_guard_required:
                 raise ProviderRequestBlocked("PROVIDER_REQUEST_GUARD_UNAVAILABLE")
             return None
+        if not callable(getattr(guard, "complete_provider_attempt", None)):
+            raise ProviderRequestBlocked("PROVIDER_REQUEST_COMPLETION_UNAVAILABLE")
         request_copy = dict(request)
         request_sha256 = canonical_request_sha256(request_copy)
         try:
@@ -2147,10 +2156,57 @@ class PluginManager:
             raise ProviderRequestBlocked("PROVIDER_REQUEST_GUARD_FAILED") from exc
         if canonical_request_sha256(request) != request_sha256:
             raise ProviderRequestBlocked("PROVIDER_REQUEST_CHANGED")
-        return validate_authorization(
+        authorization = validate_authorization(
             result,
             expected_request_sha256=request_sha256,
         )
+        with self._provider_request_guard_lock:
+            if authorization.authorization_id in self._provider_request_authorizations:
+                raise ProviderRequestBlocked("PROVIDER_REQUEST_AUTHORIZATION_REPLAY")
+            self._provider_request_authorizations.add(authorization.authorization_id)
+        return authorization
+
+    def complete_provider_request_guard(self, *, result):
+        """Require the same guard to record one consumed provider attempt."""
+        from hermes_cli.provider_request_guard import (
+            ProviderRequestBlocked,
+            validate_attempt_acknowledgment,
+            validate_attempt_result,
+        )
+
+        attempt = validate_attempt_result(result)
+        guard = self._provider_request_guard
+        completion = getattr(guard, "complete_provider_attempt", None)
+        if not callable(completion):
+            raise ProviderRequestBlocked("PROVIDER_REQUEST_COMPLETION_UNAVAILABLE")
+        with self._provider_request_guard_lock:
+            if attempt.authorization_id not in self._provider_request_authorizations:
+                raise ProviderRequestBlocked("PROVIDER_REQUEST_AUTHORIZATION_INVALID")
+            if attempt.authorization_id in self._provider_request_completions:
+                raise ProviderRequestBlocked("PROVIDER_REQUEST_COMPLETION_REPLAY")
+            prior = self._provider_request_completion_inputs.get(
+                attempt.authorization_id
+            )
+            if prior is not None and prior != attempt:
+                raise ProviderRequestBlocked("PROVIDER_REQUEST_COMPLETION_MISMATCH")
+            self._provider_request_completion_inputs[attempt.authorization_id] = attempt
+            # Serialize unknown-outcome retries for one consumed provider call.
+            # The HCP completion operation is idempotent for the exact attempt;
+            # a failed exchange therefore remains retryable, but a changed
+            # attempt or a second provider call does not.
+            try:
+                acknowledgment = completion(result=attempt)
+            except ProviderRequestBlocked:
+                raise
+            except Exception as exc:
+                raise ProviderRequestBlocked(
+                    "PROVIDER_REQUEST_COMPLETION_FAILED"
+                ) from exc
+            validated = validate_attempt_acknowledgment(
+                acknowledgment, expected=attempt
+            )
+            self._provider_request_completions.add(attempt.authorization_id)
+            return validated
 
     def has_hook(self, hook_name: str) -> bool:
         """Return True when at least one callback is registered for a hook."""
@@ -2307,6 +2363,11 @@ def enforce_provider_request_guard(
         request=request,
         **context,
     )
+
+
+def complete_provider_request_guard(*, result):
+    """Record one exact provider outcome through the configured guard."""
+    return get_plugin_manager().complete_provider_request_guard(result=result)
 
 
 def provider_request_guard_required() -> bool:

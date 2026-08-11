@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import hashlib
 import itertools
@@ -171,6 +172,56 @@ class SignedPermitServer:
             self.error = exc
 
     def _response(self, wire: dict[str, object], index: int) -> dict[str, object]:
+        if wire.get("operation") == "provider_attempt_result":
+            expected = {
+                "schema_version",
+                "operation",
+                "subject",
+                "subject_sha256",
+                "authorization_id",
+                "request_sha256",
+                "outcome",
+                "input_tokens",
+                "output_tokens",
+                "cache_tokens",
+                "total_tokens",
+                "wall_time_ms",
+                "stall_time_ms",
+                "output_bytes",
+                "error_code",
+                "issued_at",
+                "nonce",
+                "attestation_signature",
+            }
+            assert set(wire) == expected
+            unsigned_wire = dict(wire)
+            signature = unsigned_wire.pop("attestation_signature")
+            PEER_KEY.public_key().verify(
+                bytes.fromhex(signature), _canonical(unsigned_wire)
+            )
+            unsigned = {
+                "schema_version": "hermes.hcp.provider-attempt-result-ack.v1",
+                "operation": "provider_attempt_result_ack",
+                "subject_sha256": wire["subject_sha256"],
+                "authorization_id": wire["authorization_id"],
+                "request_sha256": wire["request_sha256"],
+                "outcome": "RECORDED",
+                "usage_receipt_sha256": "sha256:" + "7" * 64,
+                "response_nonce": f"{9000 + index:064x}",
+                "issued_at": datetime.now(timezone.utc)
+                .isoformat(timespec="milliseconds")
+                .replace("+00:00", "Z"),
+                "server_identity": "hcp-permit-server",
+                "server_key_id": "hcp-server-key-1",
+            }
+            if self.mode == "attempt_wrong_subject":
+                unsigned["subject_sha256"] = "sha256:" + "0" * 64
+            if self.mode == "attempt_wrong_receipt":
+                unsigned["usage_receipt_sha256"] = "sha256:" + "z" * 64
+            response = {**unsigned, "signature": _sign(SERVER_KEY, unsigned)}
+            if self.mode == "attempt_forged":
+                response["signature"] = "0" * 128
+            return response
         assert set(wire) == {
             "schema_version",
             "operation",
@@ -335,6 +386,120 @@ def test_exact_hcp_exchanges_are_signed_and_each_attempt_gets_a_new_connection(
         "api_call_count": 0,
     }
     assert "test-only-key" not in json.dumps(observed)
+
+
+def test_provider_attempt_result_repeats_subject_and_requires_signed_exact_ack(
+    tmp_path,
+) -> None:
+    from hermes_cli.provider_request_guard import (
+        ProviderAttemptResult,
+        ProviderRequestBlocked,
+    )
+
+    server = SignedPermitServer(_socket_path(tmp_path), count=2)
+    guard = _guard(server.path)
+    request = _request()
+    authorization = guard(
+        request=request, request_sha256=_digest(request), **_context()
+    )
+    acknowledgment = guard.complete_provider_attempt(
+        result=ProviderAttemptResult(
+            authorization_id=authorization.authorization_id,
+            request_sha256=authorization.request_sha256,
+            subject_sha256=authorization.subject_sha256,
+            outcome="SUCCESS",
+            input_tokens=17,
+            output_tokens=5,
+            cache_tokens=3,
+            total_tokens=22,
+            wall_time_ms=41,
+            stall_time_ms=41,
+            output_bytes=719,
+            error_code=None,
+        )
+    )
+    server.close()
+
+    permit_wire, attempt_wire = server.requests
+    assert attempt_wire["schema_version"] == (
+        "hermes.hcp.provider-attempt-result-wire.v1"
+    )
+    assert attempt_wire["operation"] == "provider_attempt_result"
+    assert attempt_wire["subject"] == permit_wire["subject"]
+    assert attempt_wire["subject_sha256"] == permit_wire["subject_sha256"]
+    assert attempt_wire["authorization_id"] == "permit-1"
+    assert attempt_wire["request_sha256"] == _digest(request)
+    assert attempt_wire["outcome"] == "SUCCESS"
+    assert attempt_wire["input_tokens"] == 17
+    assert attempt_wire["output_tokens"] == 5
+    assert attempt_wire["cache_tokens"] == 3
+    assert attempt_wire["total_tokens"] == 22
+    assert attempt_wire["wall_time_ms"] == 41
+    assert attempt_wire["stall_time_ms"] == 41
+    assert attempt_wire["output_bytes"] == 719
+    assert attempt_wire["error_code"] is None
+    assert acknowledgment.authorization_id == "permit-1"
+    assert acknowledgment.usage_receipt_sha256.startswith("sha256:")
+
+    with pytest.raises(ProviderRequestBlocked, match="ATTEMPT_REPLAY"):
+        guard.complete_provider_attempt(
+            result=ProviderAttemptResult(
+                authorization_id=authorization.authorization_id,
+                request_sha256=authorization.request_sha256,
+                subject_sha256=authorization.subject_sha256,
+                outcome="PROVIDER_ERROR",
+                input_tokens=None,
+                output_tokens=None,
+                cache_tokens=None,
+                total_tokens=None,
+                wall_time_ms=42,
+                stall_time_ms=42,
+                output_bytes=0,
+                error_code="PROVIDER_TIMEOUTERROR",
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("mode", "error"),
+    [
+        ("attempt_wrong_subject", "ATTEMPT_ACK_INVALID"),
+        ("attempt_wrong_receipt", "ATTEMPT_ACK_INVALID"),
+        ("attempt_forged", "SIGNATURE_INVALID"),
+    ],
+)
+def test_provider_attempt_ack_mismatch_or_forgery_fails_closed(
+    tmp_path, mode: str, error: str
+) -> None:
+    from hermes_cli.provider_request_guard import (
+        ProviderAttemptResult,
+        ProviderRequestBlocked,
+    )
+
+    server = SignedPermitServer(_socket_path(tmp_path), count=2, mode=mode)
+    guard = _guard(server.path)
+    request = _request()
+    authorization = guard(
+        request=request, request_sha256=_digest(request), **_context()
+    )
+    with pytest.raises(ProviderRequestBlocked, match=error):
+        guard.complete_provider_attempt(
+            result=ProviderAttemptResult(
+                authorization_id=authorization.authorization_id,
+                request_sha256=authorization.request_sha256,
+                subject_sha256=authorization.subject_sha256,
+                outcome="PROVIDER_ERROR",
+                input_tokens=None,
+                output_tokens=None,
+                cache_tokens=None,
+                total_tokens=None,
+                wall_time_ms=17,
+                stall_time_ms=17,
+                output_bytes=0,
+                error_code="PROVIDER_TIMEOUTERROR",
+            )
+        )
+    server.close()
 
 
 def test_codex_manifest_binds_exact_provider_model_effort_and_transport(
@@ -985,3 +1150,75 @@ def test_signature_or_replay_refusal_is_a_sticky_integrity_hold(
         assert held.consecutive_failures == 0
         assert kanban_db.recompute_ready(conn) == 0
         assert kanban_db.get_task(conn, task_id).status == "blocked"
+
+
+def test_completion_unknown_outcome_retries_same_attempt_without_new_provider_call() -> None:
+    from plugins.hcp_post_claim_pre_model_permit import HCPPermitGuard
+    from hermes_cli.provider_request_guard import (
+        ProviderAttemptResult,
+        ProviderRequestBlocked,
+    )
+
+    class _RetryTransport:
+        def __init__(self) -> None:
+            self.server = object.__new__(SignedPermitServer)
+            self.server.mode = "allow"
+            self.calls: list[dict[str, object]] = []
+            self.failed = False
+
+        def exchange(self, wire):
+            self.calls.append(dict(wire))
+            if wire.get("operation") == "provider_attempt_result" and not self.failed:
+                self.failed = True
+                raise OSError("response outcome unknown")
+            return SignedPermitServer._response(self.server, dict(wire), len(self.calls))
+
+    counter = itertools.count(1)
+    transport = _RetryTransport()
+    guard = HCPPermitGuard(
+        transport=transport,  # type: ignore[arg-type]
+        manifest=_manifest(),
+        peer_private_key=PEER_KEY,
+        server_public_key=SERVER_KEY.public_key(),
+        hermes_run_id="42",
+        nonce_factory=lambda: f"{next(counter):064x}",
+    )
+    request = _request()
+    authorization = guard(
+        request=request,
+        request_sha256=_digest(request),
+        **_context(),
+    )
+    attempt = ProviderAttemptResult(
+        authorization_id=authorization.authorization_id,
+        request_sha256=authorization.request_sha256,
+        subject_sha256=authorization.subject_sha256,
+        outcome="PROVIDER_ERROR",
+        input_tokens=None,
+        output_tokens=None,
+        cache_tokens=None,
+        total_tokens=None,
+        wall_time_ms=11,
+        stall_time_ms=11,
+        output_bytes=0,
+        error_code="PROVIDER_TIMEOUTERROR",
+    )
+
+    with pytest.raises(OSError, match="outcome unknown"):
+        guard.complete_provider_attempt(result=attempt)
+    with pytest.raises(ProviderRequestBlocked, match="ATTEMPT_MISMATCH"):
+        guard.complete_provider_attempt(
+            result=replace(attempt, wall_time_ms=12, stall_time_ms=12)
+        )
+
+    acknowledgment = guard.complete_provider_attempt(result=attempt)
+
+    assert acknowledgment.authorization_id == authorization.authorization_id
+    result_calls = [
+        item for item in transport.calls
+        if item.get("operation") == "provider_attempt_result"
+    ]
+    assert len(result_calls) == 2
+    assert result_calls[0]["authorization_id"] == result_calls[1]["authorization_id"]
+    with pytest.raises(ProviderRequestBlocked, match="ATTEMPT_REPLAY"):
+        guard.complete_provider_attempt(result=attempt)

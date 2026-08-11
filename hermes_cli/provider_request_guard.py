@@ -18,7 +18,11 @@ from urllib.parse import urlsplit, urlunsplit
 
 
 AUTHORIZATION_SCHEMA_VERSION = "hermes.provider-request-authorization.v1"
+ATTEMPT_RESULT_SCHEMA_VERSION = "hermes.provider-attempt-result.v1"
+ATTEMPT_ACK_SCHEMA_VERSION = "hermes.provider-attempt-ack.v1"
+MAX_PROVIDER_OUTPUT_BYTES = 100_000_000
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_ERROR_CODE = re.compile(r"[A-Z][A-Z0-9_]{0,127}\Z")
 _LOCAL_TRANSPORT_KEYS = frozenset({
     "timeout",
     "http_client",
@@ -65,6 +69,36 @@ class ProviderRequestAuthorization:
     subject_sha256: str
     expires_at_monotonic: float
     schema_version: str = AUTHORIZATION_SCHEMA_VERSION
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderAttemptResult:
+    """Closed result for the one provider call consumed by an authorization."""
+
+    authorization_id: str
+    request_sha256: str
+    subject_sha256: str
+    outcome: str
+    input_tokens: int | None
+    output_tokens: int | None
+    cache_tokens: int | None
+    total_tokens: int | None
+    wall_time_ms: int
+    stall_time_ms: int
+    output_bytes: int
+    error_code: str | None
+    schema_version: str = ATTEMPT_RESULT_SCHEMA_VERSION
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderAttemptAcknowledgment:
+    """Typed proof that HCP durably recorded one exact provider attempt."""
+
+    authorization_id: str
+    request_sha256: str
+    subject_sha256: str
+    usage_receipt_sha256: str
+    schema_version: str = ATTEMPT_ACK_SCHEMA_VERSION
 
 
 def canonical_request_sha256(request: Mapping[str, Any]) -> str:
@@ -185,6 +219,11 @@ def client_transport_identity(
     actual_endpoint = _endpoint_base_url(getattr(client, "base_url", None))
     if actual_endpoint != expected_endpoint:
         raise ProviderRequestBlocked("PROVIDER_REQUEST_ENDPOINT_MISMATCH")
+    http_client = getattr(client, "_client", None)
+    if getattr(http_client, "follow_redirects", None) is not False:
+        raise ProviderRequestBlocked("PROVIDER_REQUEST_TRANSPORT_UNSUPPORTED")
+    if getattr(client, "max_retries", None) != 0:
+        raise ProviderRequestBlocked("PROVIDER_REQUEST_TRANSPORT_UNSUPPORTED")
     default_query = getattr(client, "default_query", None)
     if default_query not in (None, {}) or (
         isinstance(default_query, Mapping) and len(default_query) != 0
@@ -261,12 +300,137 @@ def client_transport_identity(
         raise ProviderRequestBlocked("PROVIDER_REQUEST_TRANSPORT_UNSUPPORTED")
     identity = {
         "endpoint_base_url": actual_endpoint,
+        "follow_redirects": False,
+        "sdk_max_retries": 0,
         "default_headers": normalized_headers,
         "default_query": {},
         "request_headers": actual_request_headers,
         "request_query": {},
     }
     return endpoint_origin(actual_endpoint), canonical_request_sha256(identity)
+
+
+def _field(value: object, name: str) -> object:
+    if isinstance(value, Mapping):
+        return value.get(name)
+    return getattr(value, name, None)
+
+
+def _exact_nonnegative_int(value: object) -> int:
+    if type(value) is not int or value < 0:
+        raise ProviderRequestBlocked("PROVIDER_REQUEST_USAGE_INVALID")
+    return value
+
+
+def exact_provider_usage(
+    response: object, *, api_mode: str
+) -> tuple[int, int, int, int]:
+    """Extract exact provider-reported input/output/cache/total token counts."""
+
+    usage = _field(response, "usage")
+    if usage is None:
+        raise ProviderRequestBlocked("PROVIDER_REQUEST_USAGE_INVALID")
+    if api_mode == "codex_responses":
+        input_tokens = _exact_nonnegative_int(_field(usage, "input_tokens"))
+        output_tokens = _exact_nonnegative_int(_field(usage, "output_tokens"))
+        details = _field(usage, "input_tokens_details")
+    elif api_mode == "chat_completions":
+        input_tokens = _exact_nonnegative_int(_field(usage, "prompt_tokens"))
+        output_tokens = _exact_nonnegative_int(_field(usage, "completion_tokens"))
+        details = _field(usage, "prompt_tokens_details")
+    else:
+        raise ProviderRequestBlocked("PROVIDER_REQUEST_ROUTE_UNSUPPORTED")
+    total_tokens = _exact_nonnegative_int(_field(usage, "total_tokens"))
+    cache_tokens = _exact_nonnegative_int(_field(details, "cached_tokens"))
+    if cache_tokens > input_tokens or total_tokens != input_tokens + output_tokens:
+        raise ProviderRequestBlocked("PROVIDER_REQUEST_USAGE_INVALID")
+    return input_tokens, output_tokens, cache_tokens, total_tokens
+
+
+def exact_serialized_provider_output(response: object) -> bytes:
+    """Return the exact bounded canonical JSON representation of one response."""
+
+    if isinstance(response, Mapping):
+        value = dict(response)
+    else:
+        dump = getattr(response, "model_dump", None)
+        if not callable(dump):
+            raise ProviderRequestBlocked("PROVIDER_REQUEST_OUTPUT_INVALID")
+        try:
+            value = dump(mode="json")
+        except Exception as exc:
+            raise ProviderRequestBlocked("PROVIDER_REQUEST_OUTPUT_INVALID") from exc
+    if not isinstance(value, Mapping):
+        raise ProviderRequestBlocked("PROVIDER_REQUEST_OUTPUT_INVALID")
+    try:
+        encoded = json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+        if json.loads(encoded) != value:
+            raise ValueError("response does not round-trip")
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ProviderRequestBlocked("PROVIDER_REQUEST_OUTPUT_INVALID") from exc
+    if len(encoded) > MAX_PROVIDER_OUTPUT_BYTES:
+        raise ProviderRequestBlocked("PROVIDER_REQUEST_OUTPUT_TOO_LARGE")
+    return encoded
+
+
+def validate_attempt_result(value: object) -> ProviderAttemptResult:
+    if type(value) is not ProviderAttemptResult:
+        raise ProviderRequestBlocked("PROVIDER_REQUEST_COMPLETION_INVALID")
+    token_values = (
+        value.input_tokens,
+        value.output_tokens,
+        value.cache_tokens,
+        value.total_tokens,
+    )
+    valid_success = (
+        value.outcome == "SUCCESS"
+        and value.error_code is None
+        and all(type(item) is int and item >= 0 for item in token_values)
+        and value.cache_tokens <= value.input_tokens
+        and value.total_tokens == value.input_tokens + value.output_tokens
+    )
+    valid_error = (
+        value.outcome == "PROVIDER_ERROR"
+        and all(item is None for item in token_values)
+        and type(value.error_code) is str
+        and _ERROR_CODE.fullmatch(value.error_code) is not None
+    )
+    if (
+        value.schema_version != ATTEMPT_RESULT_SCHEMA_VERSION
+        or not value.authorization_id
+        or _DIGEST.fullmatch(value.request_sha256) is None
+        or _DIGEST.fullmatch(value.subject_sha256) is None
+        or not (valid_success or valid_error)
+        or type(value.wall_time_ms) is not int
+        or value.wall_time_ms < 0
+        or type(value.stall_time_ms) is not int
+        or not 0 <= value.stall_time_ms <= value.wall_time_ms
+        or type(value.output_bytes) is not int
+        or not 0 <= value.output_bytes <= MAX_PROVIDER_OUTPUT_BYTES
+    ):
+        raise ProviderRequestBlocked("PROVIDER_REQUEST_COMPLETION_INVALID")
+    return value
+
+
+def validate_attempt_acknowledgment(
+    value: object, *, expected: ProviderAttemptResult
+) -> ProviderAttemptAcknowledgment:
+    if (
+        type(value) is not ProviderAttemptAcknowledgment
+        or value.schema_version != ATTEMPT_ACK_SCHEMA_VERSION
+        or value.authorization_id != expected.authorization_id
+        or value.request_sha256 != expected.request_sha256
+        or value.subject_sha256 != expected.subject_sha256
+        or _DIGEST.fullmatch(value.usage_receipt_sha256) is None
+    ):
+        raise ProviderRequestBlocked("PROVIDER_REQUEST_COMPLETION_INVALID")
+    return value
 
 
 def validate_authorization(
@@ -305,7 +469,12 @@ def ensure_authorization_current(value: ProviderRequestAuthorization) -> None:
 
 
 __all__ = [
+    "ATTEMPT_ACK_SCHEMA_VERSION",
+    "ATTEMPT_RESULT_SCHEMA_VERSION",
     "AUTHORIZATION_SCHEMA_VERSION",
+    "MAX_PROVIDER_OUTPUT_BYTES",
+    "ProviderAttemptAcknowledgment",
+    "ProviderAttemptResult",
     "ProviderRequestAuthorization",
     "ProviderRequestBlocked",
     "ProviderRequestGuardRegistrationError",
@@ -314,6 +483,10 @@ __all__ = [
     "canonical_sdk_request",
     "canonical_model_request",
     "endpoint_origin",
+    "exact_provider_usage",
+    "exact_serialized_provider_output",
     "ensure_authorization_current",
     "validate_authorization",
+    "validate_attempt_acknowledgment",
+    "validate_attempt_result",
 ]

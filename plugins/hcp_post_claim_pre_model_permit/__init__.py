@@ -31,8 +31,11 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
 )
 
 from hermes_cli.provider_request_guard import (
+    ProviderAttemptAcknowledgment,
+    ProviderAttemptResult,
     ProviderRequestAuthorization,
     ProviderRequestBlocked,
+    validate_attempt_result,
 )
 
 from .channel import UnixSocketPermitTransport, canonical_json
@@ -44,6 +47,8 @@ RESULT_SCHEMA_VERSION = "hermes.hcp.pre-model-permit-result.v1"
 SUBJECT_SCHEMA_VERSION = "hermes.hcp.worker-subject.v1"
 PERMIT_SCHEMA_VERSION = "hcp.pre-model-permit.v2"
 PERMIT_EXCHANGE_SCHEMA_VERSION = "hcp.hermes.permit-exchange.v1"
+ATTEMPT_WIRE_SCHEMA_VERSION = "hermes.hcp.provider-attempt-result-wire.v1"
+ATTEMPT_ACK_SCHEMA_VERSION = "hermes.hcp.provider-attempt-result-ack.v1"
 
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _SOURCE_OID = re.compile(r"[0-9a-f]{40,64}\Z")
@@ -130,6 +135,40 @@ _RESULT_KEYS = {
     "server_key_id",
     "response_nonce",
     "issued_at",
+    "signature",
+}
+_ATTEMPT_WIRE_KEYS = {
+    "schema_version",
+    "operation",
+    "subject",
+    "subject_sha256",
+    "authorization_id",
+    "request_sha256",
+    "outcome",
+    "input_tokens",
+    "output_tokens",
+    "cache_tokens",
+    "total_tokens",
+    "wall_time_ms",
+    "stall_time_ms",
+    "output_bytes",
+    "error_code",
+    "issued_at",
+    "nonce",
+    "attestation_signature",
+}
+_ATTEMPT_ACK_KEYS = {
+    "schema_version",
+    "operation",
+    "subject_sha256",
+    "authorization_id",
+    "request_sha256",
+    "outcome",
+    "usage_receipt_sha256",
+    "response_nonce",
+    "issued_at",
+    "server_identity",
+    "server_key_id",
     "signature",
 }
 
@@ -443,6 +482,9 @@ class HCPPermitGuard:
         self._session_id: str | None = None
         self._used_nonces: set[str] = set()
         self._used_permit_ids: set[str] = set()
+        self._pending_attempts: dict[str, tuple[dict[str, object], str]] = {}
+        self._pending_attempt_results: dict[str, ProviderAttemptResult] = {}
+        self._completed_attempts: set[str] = set()
         self._lock = threading.Lock()
 
     def _nonce(self) -> str:
@@ -598,7 +640,7 @@ class HCPPermitGuard:
                 "attestation_signature": _sign(self._peer_private_key, unsigned_wire),
             }
             response = self._transport.exchange(wire)
-            return self._validate_response(
+            authorization = self._validate_response(
                 response,
                 permit_request=permit_request,
                 request_sha256=request_sha256,
@@ -606,6 +648,122 @@ class HCPPermitGuard:
                 permit_auth_nonce=permit_auth_nonce,
                 verify_auth_nonce=verify_auth_nonce,
             )
+            self._pending_attempts[authorization.authorization_id] = (
+                dict(subject),
+                request_sha256,
+            )
+            return authorization
+
+    def complete_provider_attempt(
+        self, *, result: ProviderAttemptResult
+    ) -> ProviderAttemptAcknowledgment:
+        """Record the exact result of one consumed permit before any retry."""
+
+        attempt = validate_attempt_result(result)
+        manifest = self._manifest
+        with self._lock:
+            if attempt.authorization_id in self._completed_attempts:
+                raise ProviderRequestBlocked("HCP_PERMIT_ATTEMPT_REPLAY")
+            pending = self._pending_attempts.get(attempt.authorization_id)
+            if pending is None:
+                raise ProviderRequestBlocked("HCP_PERMIT_ATTEMPT_REPLAY")
+            subject, request_sha256 = pending
+            if (
+                attempt.subject_sha256 != _digest(subject)
+                or attempt.request_sha256 != request_sha256
+            ):
+                raise ProviderRequestBlocked("HCP_PERMIT_ATTEMPT_MISMATCH")
+            prior = self._pending_attempt_results.get(attempt.authorization_id)
+            if prior is not None and prior != attempt:
+                raise ProviderRequestBlocked("HCP_PERMIT_ATTEMPT_MISMATCH")
+            self._pending_attempt_results[attempt.authorization_id] = attempt
+            now = self._clock()
+            if now.tzinfo != timezone.utc:
+                raise ProviderRequestBlocked("HCP_PERMIT_CLOCK_INVALID")
+            issued_at = _format_timestamp(now)
+            unsigned_wire = {
+                "schema_version": ATTEMPT_WIRE_SCHEMA_VERSION,
+                "operation": "provider_attempt_result",
+                "subject": subject,
+                "subject_sha256": attempt.subject_sha256,
+                "authorization_id": attempt.authorization_id,
+                "request_sha256": attempt.request_sha256,
+                "outcome": attempt.outcome,
+                "input_tokens": attempt.input_tokens,
+                "output_tokens": attempt.output_tokens,
+                "cache_tokens": attempt.cache_tokens,
+                "total_tokens": attempt.total_tokens,
+                "wall_time_ms": attempt.wall_time_ms,
+                "stall_time_ms": attempt.stall_time_ms,
+                "output_bytes": attempt.output_bytes,
+                "error_code": attempt.error_code,
+                "issued_at": issued_at,
+                "nonce": self._nonce(),
+            }
+            if set(unsigned_wire) | {"attestation_signature"} != _ATTEMPT_WIRE_KEYS:
+                raise ProviderRequestBlocked("HCP_PERMIT_ATTEMPT_INVALID")
+            wire = {
+                **unsigned_wire,
+                "attestation_signature": _sign(self._peer_private_key, unsigned_wire),
+            }
+            response = self._transport.exchange(wire)
+            acknowledgment = self._validate_attempt_ack(
+                response,
+                attempt=attempt,
+                request_issued_at=_timestamp(issued_at),
+            )
+            self._pending_attempts.pop(attempt.authorization_id, None)
+            self._pending_attempt_results.pop(attempt.authorization_id, None)
+            self._completed_attempts.add(attempt.authorization_id)
+            return acknowledgment
+
+    def _validate_attempt_ack(
+        self,
+        response: Mapping[str, object],
+        *,
+        attempt: ProviderAttemptResult,
+        request_issued_at: datetime,
+    ) -> ProviderAttemptAcknowledgment:
+        manifest = self._manifest
+        if (
+            not isinstance(response, Mapping)
+            or set(response) != _ATTEMPT_ACK_KEYS
+            or response.get("schema_version") != ATTEMPT_ACK_SCHEMA_VERSION
+            or response.get("operation") != "provider_attempt_result_ack"
+            or response.get("subject_sha256") != attempt.subject_sha256
+            or response.get("authorization_id") != attempt.authorization_id
+            or response.get("request_sha256") != attempt.request_sha256
+            or response.get("outcome") != "RECORDED"
+            or _DIGEST.fullmatch(str(response.get("usage_receipt_sha256"))) is None
+            or response.get("server_identity") != manifest["server_identity"]
+            or response.get("server_key_id") != manifest["server_key_id"]
+            or _NONCE.fullmatch(str(response.get("response_nonce"))) is None
+        ):
+            raise ProviderRequestBlocked("HCP_PERMIT_ATTEMPT_ACK_INVALID")
+        response_nonce = str(response["response_nonce"])
+        if response_nonce in self._used_nonces:
+            raise ProviderRequestBlocked("HCP_PERMIT_ATTEMPT_ACK_REPLAY")
+        unsigned_response = dict(response)
+        signature = unsigned_response.pop("signature")
+        _verify(self._server_public_key, unsigned_response, signature)
+        response_time = _timestamp(
+            response.get("issued_at"), "HCP_PERMIT_ATTEMPT_ACK_INVALID"
+        )
+        now = self._clock()
+        if (
+            now.tzinfo != timezone.utc
+            or response_time < request_issued_at
+            or response_time > now
+            or (now - response_time).total_seconds() > 30
+        ):
+            raise ProviderRequestBlocked("HCP_PERMIT_ATTEMPT_ACK_INVALID")
+        self._used_nonces.add(response_nonce)
+        return ProviderAttemptAcknowledgment(
+            authorization_id=attempt.authorization_id,
+            request_sha256=attempt.request_sha256,
+            subject_sha256=attempt.subject_sha256,
+            usage_receipt_sha256=str(response["usage_receipt_sha256"]),
+        )
 
     def _validate_response(
         self,

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+import json
 import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -13,10 +15,53 @@ from run_agent import AIAgent
 
 def _response(text: str = "ok") -> SimpleNamespace:
     message = SimpleNamespace(content=text, tool_calls=None)
+    payload = {
+        "id": "chatcmpl-test",
+        "object": "chat.completion",
+        "model": "test/model",
+        "choices": [{"message": {"content": text}, "finish_reason": "stop"}],
+        "usage": {
+            "prompt_tokens": 7,
+            "completion_tokens": 3,
+            "total_tokens": 10,
+            "prompt_tokens_details": {"cached_tokens": 2},
+        },
+    }
     return SimpleNamespace(
         choices=[SimpleNamespace(message=message, finish_reason="stop")],
         model="test/model",
-        usage=None,
+        usage=SimpleNamespace(
+            prompt_tokens=7,
+            completion_tokens=3,
+            total_tokens=10,
+            prompt_tokens_details=SimpleNamespace(cached_tokens=2),
+        ),
+        model_dump=lambda **_: payload,
+    )
+
+
+def _codex_response(text: str = "ok") -> SimpleNamespace:
+    payload = {
+        "id": "resp-test",
+        "object": "response",
+        "model": "gpt-5.6-sol",
+        "output": [{"type": "message", "content": text}],
+        "usage": {
+            "input_tokens": 11,
+            "output_tokens": 5,
+            "total_tokens": 16,
+            "input_tokens_details": {"cached_tokens": 4},
+        },
+    }
+    return SimpleNamespace(
+        usage=SimpleNamespace(
+            input_tokens=11,
+            output_tokens=5,
+            total_tokens=16,
+            input_tokens_details=SimpleNamespace(cached_tokens=4),
+        ),
+        model_dump=lambda **_: payload,
+        output=payload["output"],
     )
 
 
@@ -74,6 +119,8 @@ def _provider_client(callback):
             "Authorization": "Bearer test-only-key",
         },
         default_query={},
+        max_retries=0,
+        _client=SimpleNamespace(follow_redirects=False),
         chat=SimpleNamespace(
             completions=SimpleNamespace(create=lambda **kwargs: callback(kwargs))
         ),
@@ -95,9 +142,56 @@ def _codex_provider_client(callback, *, account_id: str | None = None):
         base_url="https://chatgpt.com/backend-api/codex/",
         default_headers=default_headers,
         default_query={},
+        max_retries=0,
+        _client=SimpleNamespace(follow_redirects=False),
         responses=SimpleNamespace(create=lambda **kwargs: callback(kwargs)),
         close=lambda: None,
     )
+
+
+class _CompletingGuard:
+    def __init__(self, *, events=None, completion_error: Exception | None = None):
+        self.events = events
+        self.completion_error = completion_error
+        self.authorizations = 0
+        self.results = []
+
+    def __call__(self, **kwargs):
+        from hermes_cli.provider_request_guard import ProviderRequestAuthorization
+
+        self.authorizations += 1
+        if self.events is not None:
+            self.events.append("permit")
+        return ProviderRequestAuthorization(
+            authorization_id=f"authorization-{self.authorizations}",
+            request_sha256=kwargs["request_sha256"],
+            subject_sha256="sha256:" + "6" * 64,
+            expires_at_monotonic=time.monotonic() + 30,
+        )
+
+    def complete_provider_attempt(self, *, result):
+        from hermes_cli.provider_request_guard import ProviderAttemptAcknowledgment
+
+        if self.events is not None:
+            self.events.append("completion")
+        self.results.append(result)
+        if self.completion_error is not None:
+            raise self.completion_error
+        return ProviderAttemptAcknowledgment(
+            authorization_id=result.authorization_id,
+            request_sha256=result.request_sha256,
+            subject_sha256=result.subject_sha256,
+            usage_receipt_sha256="sha256:" + "9" * 64,
+        )
+
+
+class _CallbackCompletingGuard(_CompletingGuard):
+    def __init__(self, callback, *, events=None):
+        super().__init__(events=events)
+        self.callback = callback
+
+    def __call__(self, **kwargs):
+        return self.callback(**kwargs)
 
 
 def _codex_target() -> SimpleNamespace:
@@ -187,6 +281,31 @@ def test_required_codex_guard_absence_blocks_before_provider(monkeypatch) -> Non
     target._run_codex_stream.assert_not_called()
 
 
+def test_guard_without_required_completion_method_blocks_before_provider(
+    monkeypatch,
+) -> None:
+    from agent.chat_completion_helpers import _dispatch_nonstreaming_api_request
+    from hermes_cli import plugins
+    from hermes_cli.provider_request_guard import ProviderRequestBlocked
+
+    manager = plugins.PluginManager()
+    manager._provider_request_guard_required = True
+    manager._provider_request_guard = lambda **kwargs: _authorization(
+        kwargs["request_sha256"]
+    )
+    monkeypatch.setattr(plugins, "_plugin_manager", manager)
+    provider = MagicMock(return_value=_codex_response())
+
+    with pytest.raises(ProviderRequestBlocked, match="COMPLETION_UNAVAILABLE"):
+        _dispatch_nonstreaming_api_request(
+            _codex_target(),
+            _codex_request(),
+            make_client=lambda _reason: _codex_provider_client(provider),
+        )
+
+    provider.assert_not_called()
+
+
 def test_codex_guard_binds_exact_route_immediately_before_provider(
     monkeypatch,
 ) -> None:
@@ -211,9 +330,9 @@ def test_codex_guard_binds_exact_route_immediately_before_provider(
 
     def provider(kwargs):
         events.append("provider")
-        return kwargs
+        return _codex_response()
 
-    manager._provider_request_guard = allow
+    manager._provider_request_guard = _CallbackCompletingGuard(allow, events=events)
     monkeypatch.setattr(plugins, "_plugin_manager", manager)
     target = _codex_target()
     client = _codex_provider_client(provider)
@@ -244,8 +363,8 @@ def test_codex_guard_binds_exact_route_immediately_before_provider(
     assert observed["endpoint_origin"] == "https://chatgpt.com"
     assert observed["model_tokens_requested"] == 512
     assert str(observed["transport_identity_sha256"]).startswith("sha256:")
-    assert transported == _codex_request()
-    assert events == ["client", "permit", "provider"]
+    assert transported.output
+    assert events == ["client", "permit", "provider", "completion"]
     target._run_codex_stream.assert_not_called()
 
 
@@ -378,13 +497,15 @@ def test_codex_guard_binds_real_cloudflare_and_account_headers(monkeypatch) -> N
     account_id = "account-bound-007c"
     manager = plugins.PluginManager()
     manager._provider_request_guard_required = True
-    manager._provider_request_guard = MagicMock(
+    authorize = MagicMock(
         side_effect=lambda **kwargs: _authorization(kwargs["request_sha256"])
     )
+    guard = _CallbackCompletingGuard(authorize)
+    manager._provider_request_guard = guard
     monkeypatch.setattr(plugins, "_plugin_manager", manager)
     target = _codex_target()
     target._client_kwargs["default_headers"]["ChatGPT-Account-ID"] = account_id
-    provider = MagicMock(return_value=_response())
+    provider = MagicMock(return_value=_codex_response())
 
     _dispatch_nonstreaming_api_request(
         target,
@@ -395,9 +516,8 @@ def test_codex_guard_binds_real_cloudflare_and_account_headers(monkeypatch) -> N
     )
 
     provider.assert_called_once()
-    assert manager._provider_request_guard.call_args.kwargs[
-        "transport_identity_sha256"
-    ].startswith("sha256:")
+    assert authorize.call_args.kwargs["transport_identity_sha256"].startswith("sha256:")
+    assert len(guard.results) == 1
 
 
 def test_codex_guard_rejects_cloudflare_header_rebinding(monkeypatch) -> None:
@@ -451,9 +571,9 @@ def test_codex_provider_retry_requires_a_fresh_authorization(monkeypatch) -> Non
         provider_calls += 1
         if provider_calls == 1:
             raise TimeoutError("provider outcome unknown")
-        return kwargs
+        return _codex_response()
 
-    manager._provider_request_guard = allow
+    manager._provider_request_guard = _CallbackCompletingGuard(allow)
     monkeypatch.setattr(plugins, "_plugin_manager", manager)
     target = _codex_target()
     client = _codex_provider_client(provider)
@@ -590,7 +710,7 @@ def test_guard_is_immediately_before_provider(agent, monkeypatch) -> None:
             expires_at_monotonic=time.monotonic() + 30,
         )
 
-    manager._provider_request_guard = allow
+    manager._provider_request_guard = _CallbackCompletingGuard(allow, events=events)
     monkeypatch.setattr(plugins, "_plugin_manager", manager)
 
     def provider(_request):
@@ -607,7 +727,7 @@ def test_guard_is_immediately_before_provider(agent, monkeypatch) -> None:
     result = _run(agent)
 
     assert result["completed"] is True
-    assert events == ["client", "permit", "provider"]
+    assert events == ["client", "permit", "provider", "completion"]
 
 
 def test_authorization_expiry_is_rechecked_at_provider_transport(
@@ -633,7 +753,7 @@ def test_authorization_expiry_is_rechecked_at_provider_transport(
             expires_at_monotonic=100.0,
         )
 
-    manager._provider_request_guard = allow
+    manager._provider_request_guard = _CallbackCompletingGuard(allow)
     monkeypatch.setattr(plugins, "_plugin_manager", manager)
     ticks = iter((99.0, 101.0))
     monkeypatch.setattr(
@@ -744,7 +864,7 @@ def test_provider_retry_requires_a_fresh_authorization(agent, monkeypatch) -> No
             expires_at_monotonic=time.monotonic() + 30,
         )
 
-    manager._provider_request_guard = allow
+    manager._provider_request_guard = _CallbackCompletingGuard(allow)
     monkeypatch.setattr(plugins, "_plugin_manager", manager)
     provider_calls = 0
 
@@ -828,14 +948,14 @@ def test_guard_receives_the_exact_final_model_payload(monkeypatch) -> None:
             expires_at_monotonic=time.monotonic() + 30,
         )
 
-    manager._provider_request_guard = allow
+    manager._provider_request_guard = _CallbackCompletingGuard(allow, events=events)
     monkeypatch.setattr(plugins, "_plugin_manager", manager)
 
     class Completions:
         @staticmethod
         def create(**kwargs):
             events.append("provider")
-            return kwargs
+            return _response()
 
     client = SimpleNamespace(
         base_url="https://example.invalid/v1/",
@@ -845,6 +965,8 @@ def test_guard_receives_the_exact_final_model_payload(monkeypatch) -> None:
             "Authorization": "Bearer test-only-key",
         },
         default_query={},
+        max_retries=0,
+        _client=SimpleNamespace(follow_redirects=False),
         chat=SimpleNamespace(completions=Completions()),
     )
     target = SimpleNamespace(
@@ -884,8 +1006,8 @@ def test_guard_receives_the_exact_final_model_payload(monkeypatch) -> None:
     }
     assert str(observed["transport_identity_sha256"]).startswith("sha256:")
     assert len(str(observed["transport_identity_sha256"])) == 71
-    assert transported["timeout"] == 5
-    assert events == ["permit", "provider"]
+    assert transported.choices
+    assert events == ["permit", "provider", "completion"]
 
 
 @pytest.mark.parametrize("control", ["extra_headers", "extra_query"])
@@ -969,10 +1091,16 @@ def test_guard_binds_sdk_extra_body_to_the_actual_http_body(monkeypatch) -> None
                         "message": {"role": "assistant", "content": "ok"},
                     }
                 ],
+                "usage": {
+                    "prompt_tokens": 7,
+                    "completion_tokens": 3,
+                    "total_tokens": 10,
+                    "prompt_tokens_details": {"cached_tokens": 2},
+                },
             },
         )
 
-    manager._provider_request_guard = allow
+    manager._provider_request_guard = _CallbackCompletingGuard(allow)
     monkeypatch.setattr(plugins, "_plugin_manager", manager)
     http_client = httpx.Client(transport=httpx.MockTransport(handler))
     client = OpenAI(
@@ -1105,7 +1233,7 @@ def test_guard_cannot_mutate_the_authorized_request_before_transport(
             expires_at_monotonic=time.monotonic() + 30,
         )
 
-    manager._provider_request_guard = mutate
+    manager._provider_request_guard = _CallbackCompletingGuard(mutate)
     monkeypatch.setattr(plugins, "_plugin_manager", manager)
     provider = MagicMock()
     client = _provider_client(provider)
@@ -1138,3 +1266,304 @@ def test_guard_cannot_mutate_the_authorized_request_before_transport(
         )
     provider.assert_not_called()
     assert payload["messages"][0]["content"] == "exact"
+
+
+@pytest.mark.parametrize("redirect_state", [True, None])
+def test_managed_client_must_prove_redirects_disabled_before_permit_or_provider(
+    monkeypatch, redirect_state
+) -> None:
+    from agent.chat_completion_helpers import _dispatch_nonstreaming_api_request
+    from hermes_cli import plugins
+    from hermes_cli.provider_request_guard import ProviderRequestBlocked
+
+    manager = plugins.PluginManager()
+    manager._provider_request_guard_required = True
+    guard = _CompletingGuard()
+    manager._provider_request_guard = guard
+    monkeypatch.setattr(plugins, "_plugin_manager", manager)
+    provider = MagicMock(return_value=_codex_response())
+    client = _codex_provider_client(provider)
+    if redirect_state is None:
+        client._client = SimpleNamespace()
+    else:
+        client._client.follow_redirects = redirect_state
+
+    with pytest.raises(ProviderRequestBlocked, match="TRANSPORT_UNSUPPORTED"):
+        _dispatch_nonstreaming_api_request(
+            _codex_target(),
+            _codex_request(),
+            make_client=lambda _reason: client,
+        )
+
+    assert guard.authorizations == 0
+    provider.assert_not_called()
+
+
+def test_managed_client_must_prove_sdk_retries_disabled_before_permit_or_provider(
+    monkeypatch,
+) -> None:
+    from agent.chat_completion_helpers import _dispatch_nonstreaming_api_request
+    from hermes_cli import plugins
+    from hermes_cli.provider_request_guard import ProviderRequestBlocked
+
+    manager = plugins.PluginManager()
+    manager._provider_request_guard_required = True
+    guard = _CompletingGuard()
+    manager._provider_request_guard = guard
+    monkeypatch.setattr(plugins, "_plugin_manager", manager)
+    provider = MagicMock(return_value=_codex_response())
+    client = _codex_provider_client(provider)
+    client.max_retries = 1
+
+    with pytest.raises(ProviderRequestBlocked, match="TRANSPORT_UNSUPPORTED"):
+        _dispatch_nonstreaming_api_request(
+            _codex_target(),
+            _codex_request(),
+            make_client=lambda _reason: client,
+        )
+
+    assert guard.authorizations == 0
+    provider.assert_not_called()
+
+
+def test_one_authorization_id_can_reach_only_one_provider_create(monkeypatch) -> None:
+    from agent.chat_completion_helpers import _dispatch_nonstreaming_api_request
+    from hermes_cli import plugins
+    from hermes_cli.provider_request_guard import (
+        ProviderRequestAuthorization,
+        ProviderRequestBlocked,
+    )
+
+    manager = plugins.PluginManager()
+    manager._provider_request_guard_required = True
+
+    def authorize(**kwargs):
+        return ProviderRequestAuthorization(
+            authorization_id="same-permit-id",
+            request_sha256=kwargs["request_sha256"],
+            subject_sha256="sha256:" + "6" * 64,
+            expires_at_monotonic=time.monotonic() + 30,
+        )
+
+    guard = _CallbackCompletingGuard(authorize)
+    manager._provider_request_guard = guard
+    monkeypatch.setattr(plugins, "_plugin_manager", manager)
+    provider = MagicMock(return_value=_codex_response())
+    client = _codex_provider_client(provider)
+
+    _dispatch_nonstreaming_api_request(
+        _codex_target(), _codex_request(), make_client=lambda _reason: client
+    )
+    with pytest.raises(ProviderRequestBlocked, match="AUTHORIZATION_REPLAY"):
+        _dispatch_nonstreaming_api_request(
+            _codex_target(), _codex_request(), make_client=lambda _reason: client
+        )
+
+    provider.assert_called_once()
+
+
+def test_success_is_completed_with_exact_usage_and_output_before_return(
+    monkeypatch,
+) -> None:
+    from agent.chat_completion_helpers import _dispatch_nonstreaming_api_request
+    from hermes_cli import plugins
+
+    events: list[str] = []
+    manager = plugins.PluginManager()
+    manager._provider_request_guard_required = True
+    guard = _CompletingGuard(events=events)
+    manager._provider_request_guard = guard
+    monkeypatch.setattr(plugins, "_plugin_manager", manager)
+    response = _codex_response("bounded")
+
+    def provider(_kwargs):
+        events.append("provider")
+        return response
+
+    result = _dispatch_nonstreaming_api_request(
+        _codex_target(),
+        _codex_request(),
+        make_client=lambda _reason: _codex_provider_client(provider),
+    )
+
+    assert result is response
+    assert events == ["permit", "provider", "completion"]
+    attempt = guard.results[0]
+    assert attempt.outcome == "SUCCESS"
+    assert (attempt.input_tokens, attempt.output_tokens) == (11, 5)
+    assert (attempt.cache_tokens, attempt.total_tokens) == (4, 16)
+    assert attempt.wall_time_ms >= 0
+    assert attempt.stall_time_ms == attempt.wall_time_ms
+    expected = json.dumps(
+        response.model_dump(mode="json"),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    assert attempt.output_bytes == len(expected)
+
+
+def test_ambiguous_success_usage_blocks_before_response_can_be_consumed(
+    monkeypatch,
+) -> None:
+    from agent.chat_completion_helpers import _dispatch_nonstreaming_api_request
+    from hermes_cli import plugins
+    from hermes_cli.provider_request_guard import ProviderRequestBlocked
+
+    manager = plugins.PluginManager()
+    manager._provider_request_guard_required = True
+    guard = _CompletingGuard()
+    manager._provider_request_guard = guard
+    monkeypatch.setattr(plugins, "_plugin_manager", manager)
+    response = _codex_response()
+    response.usage.total_tokens = None
+    provider = MagicMock(return_value=response)
+
+    with pytest.raises(ProviderRequestBlocked, match="USAGE_INVALID"):
+        _dispatch_nonstreaming_api_request(
+            _codex_target(),
+            _codex_request(),
+            make_client=lambda _reason: _codex_provider_client(provider),
+        )
+
+    provider.assert_called_once()
+    assert len(guard.results) == 1
+    assert guard.results[0].outcome == "PROVIDER_ERROR"
+    assert guard.results[0].error_code == "PROVIDER_RESPONSE_INVALID"
+
+
+def test_provider_exception_is_recorded_before_the_exception_can_retry(
+    monkeypatch,
+) -> None:
+    from agent.chat_completion_helpers import _dispatch_nonstreaming_api_request
+    from hermes_cli import plugins
+
+    events: list[str] = []
+    manager = plugins.PluginManager()
+    manager._provider_request_guard_required = True
+    guard = _CompletingGuard(events=events)
+    manager._provider_request_guard = guard
+    monkeypatch.setattr(plugins, "_plugin_manager", manager)
+
+    def provider(_kwargs):
+        events.append("provider")
+        raise TimeoutError("provider outcome unknown")
+
+    with pytest.raises(TimeoutError, match="outcome unknown"):
+        _dispatch_nonstreaming_api_request(
+            _codex_target(),
+            _codex_request(),
+            make_client=lambda _reason: _codex_provider_client(provider),
+        )
+
+    assert events == ["permit", "provider", "completion"]
+    attempt = guard.results[0]
+    assert attempt.outcome == "PROVIDER_ERROR"
+    assert attempt.input_tokens is None
+    assert attempt.output_bytes == 0
+    assert attempt.error_code == "PROVIDER_TIMEOUTERROR"
+
+
+def test_completion_failure_blocks_a_successful_provider_response(monkeypatch) -> None:
+    from agent.chat_completion_helpers import _dispatch_nonstreaming_api_request
+    from hermes_cli import plugins
+    from hermes_cli.provider_request_guard import ProviderRequestBlocked
+
+    manager = plugins.PluginManager()
+    manager._provider_request_guard_required = True
+    guard = _CompletingGuard(completion_error=OSError("HCP unavailable"))
+    manager._provider_request_guard = guard
+    monkeypatch.setattr(plugins, "_plugin_manager", manager)
+    provider = MagicMock(return_value=_codex_response())
+
+    with pytest.raises(ProviderRequestBlocked, match="COMPLETION_FAILED"):
+        _dispatch_nonstreaming_api_request(
+            _codex_target(),
+            _codex_request(),
+            make_client=lambda _reason: _codex_provider_client(provider),
+        )
+
+    provider.assert_called_once()
+
+
+def test_completion_failure_blocks_provider_exception_from_reaching_retry(
+    monkeypatch,
+) -> None:
+    from agent.chat_completion_helpers import _dispatch_nonstreaming_api_request
+    from hermes_cli import plugins
+    from hermes_cli.provider_request_guard import ProviderRequestBlocked
+
+    manager = plugins.PluginManager()
+    manager._provider_request_guard_required = True
+    guard = _CompletingGuard(completion_error=OSError("HCP unavailable"))
+    manager._provider_request_guard = guard
+    monkeypatch.setattr(plugins, "_plugin_manager", manager)
+
+    def provider(_kwargs):
+        raise TimeoutError("must not reach retry")
+
+    with pytest.raises(ProviderRequestBlocked, match="COMPLETION_FAILED"):
+        _dispatch_nonstreaming_api_request(
+            _codex_target(),
+            _codex_request(),
+            make_client=lambda _reason: _codex_provider_client(provider),
+        )
+
+    assert len(guard.results) == 1
+    assert guard.results[0].outcome == "PROVIDER_ERROR"
+
+
+def test_unknown_completion_exchange_can_retry_only_the_same_consumed_attempt() -> None:
+    from hermes_cli.plugins import PluginManager
+    from hermes_cli.provider_request_guard import (
+        ProviderAttemptAcknowledgment,
+        ProviderAttemptResult,
+        ProviderRequestBlocked,
+    )
+
+    class _RetryingCompletion:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def complete_provider_attempt(self, *, result):
+            self.calls += 1
+            if self.calls == 1:
+                raise OSError("ack outcome unknown")
+            return ProviderAttemptAcknowledgment(
+                authorization_id=result.authorization_id,
+                request_sha256=result.request_sha256,
+                subject_sha256=result.subject_sha256,
+                usage_receipt_sha256="sha256:" + "9" * 64,
+            )
+
+    attempt = ProviderAttemptResult(
+        authorization_id="authorization-1",
+        request_sha256="sha256:" + "1" * 64,
+        subject_sha256="sha256:" + "2" * 64,
+        outcome="PROVIDER_ERROR",
+        input_tokens=None,
+        output_tokens=None,
+        cache_tokens=None,
+        total_tokens=None,
+        wall_time_ms=17,
+        stall_time_ms=17,
+        output_bytes=0,
+        error_code="PROVIDER_TIMEOUTERROR",
+    )
+    manager = PluginManager()
+    guard = _RetryingCompletion()
+    manager._provider_request_guard = guard
+    manager._provider_request_authorizations.add(attempt.authorization_id)
+
+    with pytest.raises(ProviderRequestBlocked, match="COMPLETION_FAILED"):
+        manager.complete_provider_request_guard(result=attempt)
+    changed = replace(attempt, wall_time_ms=18, stall_time_ms=18)
+    with pytest.raises(ProviderRequestBlocked, match="COMPLETION_MISMATCH"):
+        manager.complete_provider_request_guard(result=changed)
+
+    acknowledged = manager.complete_provider_request_guard(result=attempt)
+
+    assert acknowledged.authorization_id == attempt.authorization_id
+    assert guard.calls == 2
+    with pytest.raises(ProviderRequestBlocked, match="COMPLETION_REPLAY"):
+        manager.complete_provider_request_guard(result=attempt)

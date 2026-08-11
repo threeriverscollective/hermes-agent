@@ -451,13 +451,19 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
         if agent.api_mode == "codex_responses"
         else "chat_completion_request"
     )
-    from hermes_cli.plugins import enforce_provider_request_guard
+    from hermes_cli.plugins import (
+        complete_provider_request_guard,
+        enforce_provider_request_guard,
+    )
     from hermes_cli.provider_request_guard import (
+        ProviderAttemptResult,
         ProviderRequestBlocked,
         canonical_model_request,
         canonical_sdk_request,
         client_transport_identity,
         ensure_authorization_current,
+        exact_provider_usage,
+        exact_serialized_provider_output,
     )
 
     if guard_active:
@@ -568,9 +574,89 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
             **sdk_request,
         }
         ensure_authorization_current(authorization)
-    if agent.api_mode == "codex_responses":
-        return request_client.responses.create(**api_kwargs)
-    return request_client.chat.completions.create(**api_kwargs)
+    if not guard_active:
+        if agent.api_mode == "codex_responses":
+            return request_client.responses.create(**api_kwargs)
+        return request_client.chat.completions.create(**api_kwargs)
+
+    started_ns = time.monotonic_ns()
+
+    def complete_attempt(
+        *,
+        outcome: str,
+        input_tokens: int | None,
+        output_tokens: int | None,
+        cache_tokens: int | None,
+        total_tokens: int | None,
+        output_bytes: int,
+        error_code: str | None,
+    ) -> None:
+        elapsed_ms = max(0, (time.monotonic_ns() - started_ns) // 1_000_000)
+        complete_provider_request_guard(
+            result=ProviderAttemptResult(
+                authorization_id=authorization.authorization_id,
+                request_sha256=authorization.request_sha256,
+                subject_sha256=authorization.subject_sha256,
+                outcome=outcome,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cache_tokens=cache_tokens,
+                total_tokens=total_tokens,
+                wall_time_ms=elapsed_ms,
+                # Non-streaming transport yields no authenticated provider data
+                # before the complete response, so measured stall equals wall.
+                stall_time_ms=elapsed_ms,
+                output_bytes=output_bytes,
+                error_code=error_code,
+            )
+        )
+
+    try:
+        if agent.api_mode == "codex_responses":
+            response = request_client.responses.create(**api_kwargs)
+        else:
+            response = request_client.chat.completions.create(**api_kwargs)
+    except BaseException as exc:
+        error_name = re.sub(r"[^A-Z0-9]+", "_", type(exc).__name__.upper()).strip("_")
+        complete_attempt(
+            outcome="PROVIDER_ERROR",
+            input_tokens=None,
+            output_tokens=None,
+            cache_tokens=None,
+            total_tokens=None,
+            output_bytes=0,
+            error_code=("PROVIDER_" + error_name)[:128] or "PROVIDER_ERROR",
+        )
+        raise
+
+    serialized_bytes = 0
+    try:
+        serialized = exact_serialized_provider_output(response)
+        serialized_bytes = len(serialized)
+        input_tokens, output_tokens, cache_tokens, total_tokens = exact_provider_usage(
+            response, api_mode=agent.api_mode
+        )
+    except ProviderRequestBlocked:
+        complete_attempt(
+            outcome="PROVIDER_ERROR",
+            input_tokens=None,
+            output_tokens=None,
+            cache_tokens=None,
+            total_tokens=None,
+            output_bytes=serialized_bytes,
+            error_code="PROVIDER_RESPONSE_INVALID",
+        )
+        raise
+    complete_attempt(
+        outcome="SUCCESS",
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cache_tokens=cache_tokens,
+        total_tokens=total_tokens,
+        output_bytes=serialized_bytes,
+        error_code=None,
+    )
+    return response
 
 
 def should_use_direct_api_call(agent) -> bool:
