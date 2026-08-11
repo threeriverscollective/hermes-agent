@@ -1486,6 +1486,45 @@ def test_completion_failure_blocks_a_successful_provider_response(monkeypatch) -
     provider.assert_called_once()
 
 
+def test_lost_completion_ack_retries_only_the_same_consumed_attempt(
+    monkeypatch,
+) -> None:
+    from agent.chat_completion_helpers import _dispatch_nonstreaming_api_request
+    from hermes_cli import plugins
+    from hermes_cli.provider_request_guard import ProviderAttemptAcknowledgment
+
+    class _LostAckGuard(_CompletingGuard):
+        def complete_provider_attempt(self, *, result):
+            self.results.append(result)
+            if len(self.results) == 1:
+                raise OSError("completion acknowledgment lost")
+            return ProviderAttemptAcknowledgment(
+                authorization_id=result.authorization_id,
+                request_sha256=result.request_sha256,
+                subject_sha256=result.subject_sha256,
+                usage_receipt_sha256="sha256:" + "9" * 64,
+            )
+
+    manager = plugins.PluginManager()
+    manager._provider_request_guard_required = True
+    guard = _LostAckGuard()
+    manager._provider_request_guard = guard
+    monkeypatch.setattr(plugins, "_plugin_manager", manager)
+    provider = MagicMock(return_value=_codex_response())
+
+    response = _dispatch_nonstreaming_api_request(
+        _codex_target(),
+        _codex_request(),
+        make_client=lambda _reason: _codex_provider_client(provider),
+    )
+
+    assert response.output == _codex_response().output
+    provider.assert_called_once()
+    assert guard.authorizations == 1
+    assert len(guard.results) == 2
+    assert guard.results[0] == guard.results[1]
+
+
 def test_completion_failure_blocks_provider_exception_from_reaching_retry(
     monkeypatch,
 ) -> None:
@@ -1509,7 +1548,8 @@ def test_completion_failure_blocks_provider_exception_from_reaching_retry(
             make_client=lambda _reason: _codex_provider_client(provider),
         )
 
-    assert len(guard.results) == 1
+    assert len(guard.results) == 2
+    assert guard.results[0] == guard.results[1]
     assert guard.results[0].outcome == "PROVIDER_ERROR"
 
 

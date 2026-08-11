@@ -592,24 +592,37 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
         error_code: str | None,
     ) -> None:
         elapsed_ms = max(0, (time.monotonic_ns() - started_ns) // 1_000_000)
-        complete_provider_request_guard(
-            result=ProviderAttemptResult(
-                authorization_id=authorization.authorization_id,
-                request_sha256=authorization.request_sha256,
-                subject_sha256=authorization.subject_sha256,
-                outcome=outcome,
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                cache_tokens=cache_tokens,
-                total_tokens=total_tokens,
-                wall_time_ms=elapsed_ms,
-                # Non-streaming transport yields no authenticated provider data
-                # before the complete response, so measured stall equals wall.
-                stall_time_ms=elapsed_ms,
-                output_bytes=output_bytes,
-                error_code=error_code,
-            )
+        result = ProviderAttemptResult(
+            authorization_id=authorization.authorization_id,
+            request_sha256=authorization.request_sha256,
+            subject_sha256=authorization.subject_sha256,
+            outcome=outcome,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cache_tokens=cache_tokens,
+            total_tokens=total_tokens,
+            wall_time_ms=elapsed_ms,
+            # Non-streaming transport yields no authenticated provider data
+            # before the complete response, so measured stall equals wall.
+            stall_time_ms=elapsed_ms,
+            output_bytes=output_bytes,
+            error_code=error_code,
         )
+        # A lost completion acknowledgment is an unknown exchange outcome, not
+        # permission for another provider call. Retry once with the exact same
+        # immutable result. All typed refusals other than transport failure and
+        # a second unknown outcome remain fatal.
+        for completion_index in range(2):
+            try:
+                complete_provider_request_guard(result=result)
+            except ProviderRequestBlocked as exc:
+                if (
+                    exc.error_code != "PROVIDER_REQUEST_COMPLETION_FAILED"
+                    or completion_index == 1
+                ):
+                    raise
+            else:
+                return
 
     try:
         if agent.api_mode == "codex_responses":
