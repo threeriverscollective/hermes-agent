@@ -474,6 +474,15 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
         expected_request_headers: dict[str, str] = {}
         expected_client_headers: dict[str, str] = {}
         if agent.api_mode == "codex_responses":
+            # Managed Codex requests use one closed top-level body.  The SDK
+            # merges extra_body after ordinary fields, so even a body that HCP
+            # authenticated as non-streaming/non-stored could otherwise be
+            # changed at the transport boundary.
+            extra_body = api_kwargs.get("extra_body")
+            if extra_body not in (None, {}) or wire_request.get("store") is not False:
+                raise ProviderRequestBlocked("PROVIDER_REQUEST_ROUTE_UNSUPPORTED")
+            if wire_request.get("stream") not in (None, False):
+                raise ProviderRequestBlocked("PROVIDER_REQUEST_ROUTE_UNSUPPORTED")
             from agent.transports.codex import _bounded_prompt_cache_key
 
             cache_scope = _bounded_prompt_cache_key(context.get("session_id"))

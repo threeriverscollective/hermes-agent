@@ -274,6 +274,72 @@ def test_codex_guard_requires_a_provider_side_output_ceiling(monkeypatch) -> Non
     provider.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    "extra_body",
+    [
+        {"stream": True},
+        {"store": True},
+        {"metadata": {"unbound": "value"}},
+    ],
+)
+def test_codex_guard_rejects_extra_body_before_permit_or_provider(
+    monkeypatch, extra_body: dict[str, object]
+) -> None:
+    from agent.chat_completion_helpers import _dispatch_nonstreaming_api_request
+    from hermes_cli import plugins
+    from hermes_cli.provider_request_guard import ProviderRequestBlocked
+
+    manager = plugins.PluginManager()
+    manager._provider_request_guard_required = True
+    manager._provider_request_guard = MagicMock()
+    monkeypatch.setattr(plugins, "_plugin_manager", manager)
+    target = _codex_target()
+    provider = MagicMock()
+    request = _codex_request()
+    request["extra_body"] = extra_body
+
+    with pytest.raises(ProviderRequestBlocked, match="ROUTE_UNSUPPORTED"):
+        _dispatch_nonstreaming_api_request(
+            target,
+            request,
+            make_client=lambda _reason: _codex_provider_client(provider),
+        )
+
+    manager._provider_request_guard.assert_not_called()
+    provider.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("store", True), ("store", None), ("stream", True)],
+)
+def test_codex_guard_requires_non_streaming_non_stored_final_body(
+    monkeypatch, field: str, value: object
+) -> None:
+    from agent.chat_completion_helpers import _dispatch_nonstreaming_api_request
+    from hermes_cli import plugins
+    from hermes_cli.provider_request_guard import ProviderRequestBlocked
+
+    manager = plugins.PluginManager()
+    manager._provider_request_guard_required = True
+    manager._provider_request_guard = MagicMock()
+    monkeypatch.setattr(plugins, "_plugin_manager", manager)
+    target = _codex_target()
+    provider = MagicMock()
+    request = _codex_request()
+    request[field] = value
+
+    with pytest.raises(ProviderRequestBlocked, match="ROUTE_UNSUPPORTED"):
+        _dispatch_nonstreaming_api_request(
+            target,
+            request,
+            make_client=lambda _reason: _codex_provider_client(provider),
+        )
+
+    manager._provider_request_guard.assert_not_called()
+    provider.assert_not_called()
+
+
 def test_codex_guard_rejects_unbound_transport_header_before_provider(
     monkeypatch,
 ) -> None:

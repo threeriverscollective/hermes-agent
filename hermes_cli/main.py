@@ -14194,6 +14194,26 @@ def main():
     build_plugins_parser(subparsers, cmd_plugins=cmd_plugins)
 
     # =========================================================================
+    # hcp-assignment command — provider-free, assignment-only selection
+    # =========================================================================
+    # This command is deliberately a first-party parser entry rather than a
+    # user-configured profile or optional plugin.  HCP can therefore bind one
+    # exact reviewed Hermes distribution without installing or changing the
+    # shared plugin catalog.
+    from hermes_cli.hcp_assignment import (
+        _register_cli as _register_hcp_assignment_cli,
+        hcp_assignment_command,
+    )
+
+    hcp_assignment_parser = subparsers.add_parser(
+        "hcp-assignment",
+        help="Select one installed profile from a closed HCP allowlist",
+        description="Provider-free assignment-only HCP routing bridge.",
+    )
+    _register_hcp_assignment_cli(hcp_assignment_parser)
+    hcp_assignment_parser.set_defaults(func=hcp_assignment_command)
+
+    # =========================================================================
     # Plugin CLI commands — dynamically registered by memory/general plugins.
     # Plugins provide a register_cli(subparser) function that builds their
     # own argparse tree.  No hardcoded plugin commands in main.py.
