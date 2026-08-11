@@ -70,6 +70,59 @@ def _provider_client(callback):
     )
 
 
+def _codex_provider_client(callback):
+    return SimpleNamespace(
+        base_url="https://chatgpt.com/backend-api/codex/",
+        default_headers={
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Authorization": "Bearer test-only-key",
+        },
+        default_query={},
+        responses=SimpleNamespace(create=lambda **kwargs: callback(kwargs)),
+        close=lambda: None,
+    )
+
+
+def _codex_target() -> SimpleNamespace:
+    return SimpleNamespace(
+        api_mode="codex_responses",
+        provider="openai-codex",
+        api_key="test-only-key",
+        base_url="https://chatgpt.com/backend-api/codex",
+        _provider_request_guard_context={
+            "task_id": "card-7",
+            "turn_id": "turn-1",
+            "api_request_id": "turn-1:api:0",
+            "session_id": "session-9",
+            "profile_id": "hcp-general-implementer",
+            "provider": "openai-codex",
+            "model": "gpt-5.6-sol",
+            "api_mode": "codex_responses",
+            "api_call_count": 0,
+        },
+        _run_codex_stream=MagicMock(),
+    )
+
+
+def _codex_request() -> dict[str, object]:
+    return {
+        "model": "gpt-5.6-sol",
+        "instructions": "Do the bounded task.",
+        "input": [{"role": "user", "content": "exact"}],
+        "store": False,
+        "reasoning": {"effort": "high", "summary": "auto"},
+        "max_output_tokens": 512,
+        "include": ["reasoning.encrypted_content"],
+        "prompt_cache_key": "pck_exact",
+        "extra_headers": {
+            "session_id": "session-9",
+            "x-client-request-id": "session-9",
+        },
+        "timeout": 30.0,
+    }
+
+
 def test_required_guard_absence_blocks_before_provider(agent, monkeypatch) -> None:
     from hermes_cli import plugins
     from hermes_cli.provider_request_guard import ProviderRequestBlocked
@@ -87,6 +140,192 @@ def test_required_guard_absence_blocks_before_provider(agent, monkeypatch) -> No
         _run(agent)
 
     provider.assert_not_called()
+
+
+def test_required_codex_guard_absence_blocks_before_provider(monkeypatch) -> None:
+    from agent.chat_completion_helpers import _dispatch_nonstreaming_api_request
+    from hermes_cli import plugins
+    from hermes_cli.provider_request_guard import ProviderRequestBlocked
+
+    manager = plugins.PluginManager()
+    manager._provider_request_guard_required = True
+    monkeypatch.setattr(plugins, "_plugin_manager", manager)
+    provider = MagicMock()
+    target = _codex_target()
+    client = _codex_provider_client(provider)
+
+    with pytest.raises(ProviderRequestBlocked, match="GUARD_UNAVAILABLE"):
+        _dispatch_nonstreaming_api_request(
+            target,
+            _codex_request(),
+            make_client=lambda _reason: client,
+        )
+
+    provider.assert_not_called()
+    target._run_codex_stream.assert_not_called()
+
+
+def test_codex_guard_binds_exact_route_immediately_before_provider(
+    monkeypatch,
+) -> None:
+    from agent.chat_completion_helpers import _dispatch_nonstreaming_api_request
+    from hermes_cli import plugins
+    from hermes_cli.provider_request_guard import ProviderRequestAuthorization
+
+    events: list[str] = []
+    observed: dict[str, object] = {}
+    manager = plugins.PluginManager()
+    manager._provider_request_guard_required = True
+
+    def allow(**kwargs):
+        observed.update(kwargs)
+        events.append("permit")
+        return ProviderRequestAuthorization(
+            authorization_id="codex-authorization",
+            request_sha256=kwargs["request_sha256"],
+            subject_sha256="sha256:" + "6" * 64,
+            expires_at_monotonic=time.monotonic() + 30,
+        )
+
+    def provider(kwargs):
+        events.append("provider")
+        return kwargs
+
+    manager._provider_request_guard = allow
+    monkeypatch.setattr(plugins, "_plugin_manager", manager)
+    target = _codex_target()
+    client = _codex_provider_client(provider)
+
+    def make_client(_reason):
+        events.append("client")
+        return client
+
+    transported = _dispatch_nonstreaming_api_request(
+        target,
+        _codex_request(),
+        make_client=make_client,
+    )
+
+    assert observed["request"] == {
+        "include": ["reasoning.encrypted_content"],
+        "input": [{"role": "user", "content": "exact"}],
+        "instructions": "Do the bounded task.",
+        "max_output_tokens": 512,
+        "model": "gpt-5.6-sol",
+        "prompt_cache_key": "pck_exact",
+        "reasoning": {"effort": "high", "summary": "auto"},
+        "store": False,
+    }
+    assert observed["provider"] == "openai-codex"
+    assert observed["model"] == "gpt-5.6-sol"
+    assert observed["api_mode"] == "codex_responses"
+    assert observed["endpoint_origin"] == "https://chatgpt.com"
+    assert observed["model_tokens_requested"] == 512
+    assert str(observed["transport_identity_sha256"]).startswith("sha256:")
+    assert transported == _codex_request()
+    assert events == ["client", "permit", "provider"]
+    target._run_codex_stream.assert_not_called()
+
+
+def test_codex_guard_requires_a_provider_side_output_ceiling(monkeypatch) -> None:
+    from agent.chat_completion_helpers import _dispatch_nonstreaming_api_request
+    from hermes_cli import plugins
+    from hermes_cli.provider_request_guard import ProviderRequestBlocked
+
+    manager = plugins.PluginManager()
+    manager._provider_request_guard_required = True
+    manager._provider_request_guard = MagicMock()
+    monkeypatch.setattr(plugins, "_plugin_manager", manager)
+    target = _codex_target()
+    provider = MagicMock()
+    request = _codex_request()
+    request.pop("max_output_tokens")
+
+    with pytest.raises(ProviderRequestBlocked, match="MODEL_BUDGET_UNBOUNDED"):
+        _dispatch_nonstreaming_api_request(
+            target,
+            request,
+            make_client=lambda _reason: _codex_provider_client(provider),
+        )
+
+    manager._provider_request_guard.assert_not_called()
+    provider.assert_not_called()
+
+
+def test_codex_guard_rejects_unbound_transport_header_before_provider(
+    monkeypatch,
+) -> None:
+    from agent.chat_completion_helpers import _dispatch_nonstreaming_api_request
+    from hermes_cli import plugins
+    from hermes_cli.provider_request_guard import ProviderRequestBlocked
+
+    manager = plugins.PluginManager()
+    manager._provider_request_guard_required = True
+    manager._provider_request_guard = MagicMock()
+    monkeypatch.setattr(plugins, "_plugin_manager", manager)
+    target = _codex_target()
+    provider = MagicMock()
+    request = _codex_request()
+    request["extra_headers"] = {
+        "session_id": "session-9",
+        "x-client-request-id": "session-9",
+        "x-unbound-route": "forbidden",
+    }
+
+    with pytest.raises(ProviderRequestBlocked, match="TRANSPORT_UNSUPPORTED"):
+        _dispatch_nonstreaming_api_request(
+            target,
+            request,
+            make_client=lambda _reason: _codex_provider_client(provider),
+        )
+
+    manager._provider_request_guard.assert_not_called()
+    provider.assert_not_called()
+
+
+def test_codex_provider_retry_requires_a_fresh_authorization(monkeypatch) -> None:
+    from agent.chat_completion_helpers import _dispatch_nonstreaming_api_request
+    from hermes_cli import plugins
+    from hermes_cli.provider_request_guard import ProviderRequestAuthorization
+
+    manager = plugins.PluginManager()
+    manager._provider_request_guard_required = True
+    authorizations: list[str] = []
+
+    def allow(**kwargs):
+        authorization_id = f"codex-authorization-{len(authorizations) + 1}"
+        authorizations.append(authorization_id)
+        return ProviderRequestAuthorization(
+            authorization_id=authorization_id,
+            request_sha256=kwargs["request_sha256"],
+            subject_sha256="sha256:" + "6" * 64,
+            expires_at_monotonic=time.monotonic() + 30,
+        )
+
+    provider_calls = 0
+
+    def provider(kwargs):
+        nonlocal provider_calls
+        provider_calls += 1
+        if provider_calls == 1:
+            raise TimeoutError("provider outcome unknown")
+        return kwargs
+
+    manager._provider_request_guard = allow
+    monkeypatch.setattr(plugins, "_plugin_manager", manager)
+    target = _codex_target()
+    client = _codex_provider_client(provider)
+
+    with pytest.raises(TimeoutError, match="outcome unknown"):
+        _dispatch_nonstreaming_api_request(
+            target, _codex_request(), make_client=lambda _reason: client
+        )
+    _dispatch_nonstreaming_api_request(
+        target, _codex_request(), make_client=lambda _reason: client
+    )
+
+    assert provider_calls == 2
+    assert authorizations == ["codex-authorization-1", "codex-authorization-2"]
 
 
 def test_required_guard_refusal_returns_only_a_neutral_hold(agent, monkeypatch) -> None:

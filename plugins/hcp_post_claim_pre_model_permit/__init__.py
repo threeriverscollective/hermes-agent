@@ -38,7 +38,7 @@ from hermes_cli.provider_request_guard import (
 from .channel import UnixSocketPermitTransport, canonical_json
 
 
-MANIFEST_SCHEMA_VERSION = "hermes.hcp.pre-model-permit-client.v1"
+MANIFEST_SCHEMA_VERSION = "hermes.hcp.pre-model-permit-client.v2"
 WIRE_SCHEMA_VERSION = "hermes.hcp.pre-model-permit-wire.v1"
 RESULT_SCHEMA_VERSION = "hermes.hcp.pre-model-permit-result.v1"
 SUBJECT_SCHEMA_VERSION = "hermes.hcp.worker-subject.v1"
@@ -89,6 +89,8 @@ _MANIFEST_KEYS = {
     "model",
     "api_mode",
     "endpoint_origin",
+    "reasoning_effort",
+    "transport_mode",
     "peer_identity",
     "peer_key_id",
     "server_identity",
@@ -266,7 +268,22 @@ def _validate_manifest(value: object) -> dict[str, object]:
         if _DIGEST.fullmatch(str(manifest.get(key))) is None:
             raise ProviderRequestBlocked("HCP_PERMIT_MANIFEST_INVALID")
     if (
-        manifest["api_mode"] != "chat_completions"
+        manifest["api_mode"] not in {"chat_completions", "codex_responses"}
+        or manifest.get("transport_mode") != "non_streaming"
+        or (
+            manifest["api_mode"] == "chat_completions"
+            and manifest.get("reasoning_effort") is not None
+        )
+        or (
+            manifest["api_mode"] == "codex_responses"
+            and (
+                manifest.get("provider") != "openai-codex"
+                or type(manifest.get("reasoning_effort")) is not str
+                or not str(manifest["reasoning_effort"])
+                or manifest["reasoning_effort"]
+                != str(manifest["reasoning_effort"]).strip()
+            )
+        )
         or type(manifest.get("permit_ttl_seconds")) is not int
         or not 1 <= manifest["permit_ttl_seconds"] <= 30
         or type(manifest.get("model_tokens_per_request")) is not int
@@ -468,12 +485,19 @@ class HCPPermitGuard:
             or api_mode != manifest["api_mode"]
             or endpoint_origin != manifest["endpoint_origin"]
             or _DIGEST.fullmatch(transport_identity_sha256) is None
-            or transport_mode != "non_streaming"
+            or transport_mode != manifest["transport_mode"]
             or request.get("model") != model
             or type(api_call_count) is not int
             or api_call_count < 0
         ):
             raise ProviderRequestBlocked("HCP_PERMIT_IDENTITY_MISMATCH")
+        if api_mode == "codex_responses":
+            reasoning = request.get("reasoning")
+            if (
+                not isinstance(reasoning, Mapping)
+                or reasoning.get("effort") != manifest["reasoning_effort"]
+            ):
+                raise ProviderRequestBlocked("HCP_PERMIT_IDENTITY_MISMATCH")
         for value in (turn_id, api_request_id, session_id):
             _text(value, "HCP_PERMIT_IDENTITY_MISMATCH")
         requested_tokens = (

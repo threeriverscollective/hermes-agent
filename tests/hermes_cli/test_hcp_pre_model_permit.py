@@ -83,7 +83,7 @@ def _snapshot() -> dict[str, object]:
 
 def _manifest() -> dict[str, object]:
     return {
-        "schema_version": "hermes.hcp.pre-model-permit-client.v1",
+        "schema_version": "hermes.hcp.pre-model-permit-client.v2",
         "task_id": "card-7",
         "generation_id": "generation-3",
         "board_id": "hcp-board",
@@ -94,6 +94,8 @@ def _manifest() -> dict[str, object]:
         "model": "test-model",
         "api_mode": "chat_completions",
         "endpoint_origin": "https://example.invalid",
+        "reasoning_effort": None,
+        "transport_mode": "non_streaming",
         "peer_identity": "hermes-worker/card-7",
         "peer_key_id": "hermes-peer-key-1",
         "server_identity": "hcp-permit-server",
@@ -264,7 +266,7 @@ class SignedPermitServer:
         return response
 
 
-def _guard(path: Path):
+def _guard(path: Path, *, manifest: dict[str, object] | None = None):
     from plugins.hcp_post_claim_pre_model_permit import HCPPermitGuard
     from plugins.hcp_post_claim_pre_model_permit.channel import (
         UnixSocketPermitTransport,
@@ -273,7 +275,7 @@ def _guard(path: Path):
     counter = itertools.count(1)
     return HCPPermitGuard(
         transport=UnixSocketPermitTransport(str(path)),
-        manifest=_manifest(),
+        manifest=manifest or _manifest(),
         peer_private_key=PEER_KEY,
         server_public_key=SERVER_KEY.public_key(),
         hermes_run_id="42",
@@ -333,6 +335,93 @@ def test_exact_hcp_exchanges_are_signed_and_each_attempt_gets_a_new_connection(
         "api_call_count": 0,
     }
     assert "test-only-key" not in json.dumps(observed)
+
+
+def test_codex_manifest_binds_exact_provider_model_effort_and_transport(
+    tmp_path,
+) -> None:
+    manifest = {
+        **_manifest(),
+        "provider": "openai-codex",
+        "model": "gpt-5.6-sol",
+        "api_mode": "codex_responses",
+        "endpoint_origin": "https://chatgpt.com",
+        "reasoning_effort": "high",
+    }
+    server = SignedPermitServer(_socket_path(tmp_path))
+    guard = _guard(server.path, manifest=manifest)
+    request = {
+        "model": "gpt-5.6-sol",
+        "instructions": "Do the bounded task.",
+        "input": [{"role": "user", "content": "exact"}],
+        "store": False,
+        "reasoning": {"effort": "high", "summary": "auto"},
+        "max_output_tokens": 512,
+    }
+    context = {
+        **_context(),
+        "provider": "openai-codex",
+        "model": "gpt-5.6-sol",
+        "api_mode": "codex_responses",
+        "endpoint_origin": "https://chatgpt.com",
+        "model_tokens_requested": 512,
+    }
+
+    authorization = guard(
+        request=request,
+        request_sha256=_digest(request),
+        **context,
+    )
+    server.close()
+
+    assert authorization.authorization_id == "permit-1"
+    observed = server.requests[0]
+    assert observed["subject"]["provider"] == "openai-codex"
+    assert observed["subject"]["model"] == "gpt-5.6-sol"
+    assert observed["subject"]["api_mode"] == "codex_responses"
+    assert observed["subject"]["endpoint_origin"] == "https://chatgpt.com"
+    assert observed["permit_exchange"]["request"]["model_tokens_requested"] == 512
+    assert observed["permit_exchange"]["request"]["canonical_model_request"] == request
+
+
+def test_codex_effort_substitution_never_contacts_hcp() -> None:
+    from plugins.hcp_post_claim_pre_model_permit import HCPPermitGuard
+    from hermes_cli.provider_request_guard import ProviderRequestBlocked
+
+    manifest = {
+        **_manifest(),
+        "provider": "openai-codex",
+        "model": "gpt-5.6-sol",
+        "api_mode": "codex_responses",
+        "endpoint_origin": "https://chatgpt.com",
+        "reasoning_effort": "high",
+    }
+    transport = SimpleNamespace(exchange=lambda _request: pytest.fail("contacted HCP"))
+    guard = HCPPermitGuard(
+        transport=transport,
+        manifest=manifest,
+        peer_private_key=PEER_KEY,
+        server_public_key=SERVER_KEY.public_key(),
+        hermes_run_id="42",
+        nonce_factory=lambda: "a" * 64,
+    )
+    request = {
+        "model": "gpt-5.6-sol",
+        "input": [{"role": "user", "content": "exact"}],
+        "reasoning": {"effort": "low"},
+        "max_output_tokens": 512,
+    }
+    context = {
+        **_context(),
+        "provider": "openai-codex",
+        "model": "gpt-5.6-sol",
+        "api_mode": "codex_responses",
+        "endpoint_origin": "https://chatgpt.com",
+        "model_tokens_requested": 512,
+    }
+
+    with pytest.raises(ProviderRequestBlocked, match="IDENTITY_MISMATCH"):
+        guard(request=request, request_sha256=_digest(request), **context)
 
 
 @pytest.mark.parametrize(

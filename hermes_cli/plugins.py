@@ -56,7 +56,7 @@ from hermes_cli.middleware import OBSERVER_SCHEMA_VERSION, VALID_MIDDLEWARE
 
 _HCP_PROVIDER_GUARD_PLUGIN = "hcp_post_claim_pre_model_permit"
 _HCP_PROVIDER_GUARD_FILES: dict[str, str] = {
-    "__init__.py": "941ddc629b0fd7187331736f72d5ae324b09efb5523241156ee74a43c58e0675",
+    "__init__.py": "e67502adf624b9617fcb00df8f5cd93ea75d29cee18eabf40bc39dfdb1d505ad",
     "channel.py": "a2c4ab14149bdabd6d1b8dce03d7ad3a37ff25d6c0e44f3faf27f08f76e75f50",
     "plugin.yaml": "b5a44bb3cdef47559b7b533dd8bf1671861e572b52bb2003eba539fae6282d5c",
 }

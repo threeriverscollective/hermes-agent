@@ -724,8 +724,12 @@ def run_conversation(
         _manager = _get_plugin_manager()
         if (
             agent.compression_enabled
-            or agent.api_mode != "chat_completions"
+            or agent.api_mode not in {"chat_completions", "codex_responses"}
             or agent.provider == "moa"
+            or (
+                agent.api_mode == "codex_responses"
+                and agent.provider != "openai-codex"
+            )
             or env_var_enabled("HERMES_KANBAN_GOAL_MODE")
             or _manager.has_hook("pre_llm_call")
             or _manager.has_hook("pre_api_request")

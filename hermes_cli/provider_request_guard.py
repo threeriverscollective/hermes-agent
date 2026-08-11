@@ -167,6 +167,9 @@ def client_transport_identity(
     *,
     expected_base_url: str,
     expected_api_key: str,
+    request_headers: object = None,
+    expected_request_headers: Mapping[str, str] | None = None,
+    request_query: object = None,
 ) -> tuple[str, str]:
     """Validate and hash the actual request client's credential-free route.
 
@@ -212,10 +215,32 @@ def client_transport_identity(
         or normalized_headers.get("authorization") != f"Bearer {expected_api_key}"
     ):
         raise ProviderRequestBlocked("PROVIDER_REQUEST_CREDENTIAL_MISMATCH")
+    if request_query not in (None, {}) or (
+        isinstance(request_query, Mapping) and len(request_query) != 0
+    ):
+        raise ProviderRequestBlocked("PROVIDER_REQUEST_TRANSPORT_UNSUPPORTED")
+    expected_headers = dict(expected_request_headers or {})
+    if request_headers is None:
+        actual_request_headers: dict[str, str] = {}
+    elif isinstance(request_headers, Mapping):
+        actual_request_headers = {}
+        for raw_name, raw_value in request_headers.items():
+            if type(raw_name) is not str or type(raw_value) is not str:
+                raise ProviderRequestBlocked("PROVIDER_REQUEST_TRANSPORT_INVALID")
+            name = raw_name.strip().lower()
+            if not name or name in actual_request_headers:
+                raise ProviderRequestBlocked("PROVIDER_REQUEST_TRANSPORT_INVALID")
+            actual_request_headers[name] = raw_value
+    else:
+        raise ProviderRequestBlocked("PROVIDER_REQUEST_TRANSPORT_INVALID")
+    if actual_request_headers != expected_headers:
+        raise ProviderRequestBlocked("PROVIDER_REQUEST_TRANSPORT_UNSUPPORTED")
     identity = {
         "endpoint_base_url": actual_endpoint,
         "default_headers": normalized_headers,
         "default_query": {},
+        "request_headers": actual_request_headers,
+        "request_query": {},
     }
     return endpoint_origin(actual_endpoint), canonical_request_sha256(identity)
 

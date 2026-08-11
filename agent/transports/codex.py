@@ -375,7 +375,14 @@ class ResponsesApiTransport(ProviderTransport):
                 kwargs["extra_headers"] = merged_extra_headers
 
         max_tokens = params.get("max_tokens")
-        if max_tokens is not None and not is_codex_backend:
+        managed_provider_request = False
+        if is_codex_backend:
+            from hermes_cli.plugins import provider_request_guard_required
+
+            managed_provider_request = provider_request_guard_required()
+        if max_tokens is not None and (
+            not is_codex_backend or managed_provider_request
+        ):
             kwargs["max_output_tokens"] = max_tokens
 
         if is_xai_responses and session_id:

@@ -303,6 +303,25 @@ class TestCodexBuildKwargs:
         )
         assert "max_output_tokens" not in kw
 
+    def test_managed_codex_backend_sets_exact_max_output_tokens(
+        self, transport, monkeypatch
+    ):
+        from hermes_cli import plugins
+
+        manager = plugins.PluginManager()
+        manager._provider_request_guard_required = True
+        monkeypatch.setattr(plugins, "_plugin_manager", manager)
+
+        kw = transport.build_kwargs(
+            model="gpt-5.6-sol",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[],
+            max_tokens=4096,
+            is_codex_backend=True,
+        )
+
+        assert kw["max_output_tokens"] == 4096
+
     def test_codex_backend_sets_cache_routing_headers(self, transport):
         """Codex backend sends session_id / x-client-request-id as HTTP
         headers (via extra_headers) for cache-scope routing."""
