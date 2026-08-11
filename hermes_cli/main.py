@@ -13318,7 +13318,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         # Help-ish invocations — plugin commands not being listed in
         # top-level --help is an acceptable trade-off for skipping an
         # expensive eager import of every bundled plugin module.
-        "help",
+        "help", "hcp-assignment",
     }
 )
 

@@ -9,6 +9,19 @@ from pathlib import Path
 import pytest
 
 
+def _profile(root: Path, profile_id: str) -> None:
+    profile = root / profile_id
+    profile.mkdir(parents=True)
+    (profile / "config.yaml").write_text(
+        "model:\n"
+        "  default: gpt-5.6-sol\n"
+        "  provider: openai-codex\n"
+        "agent:\n"
+        "  reasoning_effort: high\n",
+        encoding="utf-8",
+    )
+
+
 def _request(*profiles: str) -> dict[str, object]:
     return {
         "schema_version": 1,
@@ -34,7 +47,7 @@ def test_single_installed_allowlisted_profile_is_selected_without_provider_call(
     from hermes_cli.hcp_assignment import route_assignment
 
     root = tmp_path / "profiles"
-    (root / "hcp-general-implementer").mkdir(parents=True)
+    _profile(root, "hcp-general-implementer")
     provider_calls: list[object] = []
     monkeypatch.setattr(
         "agent.auxiliary_client.call_llm",
@@ -86,7 +99,6 @@ def test_single_installed_allowlisted_profile_is_selected_without_provider_call(
     [
         (),
         ("hcp-general-implementer", "hcp-pr-acceptance-reviewer"),
-        ("missing-profile",),
     ],
 )
 def test_ambiguous_or_unavailable_profile_returns_no_fit_without_provider_call(
@@ -97,8 +109,8 @@ def test_ambiguous_or_unavailable_profile_returns_no_fit_without_provider_call(
     from hermes_cli.hcp_assignment import route_assignment
 
     root = tmp_path / "profiles"
-    (root / "hcp-general-implementer").mkdir(parents=True)
-    (root / "hcp-pr-acceptance-reviewer").mkdir()
+    _profile(root, "hcp-general-implementer")
+    _profile(root, "hcp-pr-acceptance-reviewer")
     provider_calls: list[object] = []
     monkeypatch.setattr(
         "agent.auxiliary_client.call_llm",
@@ -142,6 +154,61 @@ def test_cli_registration_is_closed_and_requires_a_bound_profiles_root() -> None
     )
 
     assert parsed.profiles_root == "/private/var/hcp-007c/profiles"
+
+
+def test_empty_or_wrong_route_profile_is_never_selected(tmp_path: Path) -> None:
+    from hermes_cli.hcp_assignment import AssignmentRefusal, route_assignment
+
+    root = tmp_path / "profiles"
+    (root / "hcp-general-implementer").mkdir(parents=True)
+    assert route_assignment(
+        _request("hcp-general-implementer"),
+        profiles_root=root,
+        run_id="assignment:007c:empty",
+        provider="openai-codex",
+        model="gpt-5.6-sol",
+        effort="high",
+        attempted_profile_id="hcp_assignment_only",
+    )["selection"] == "NO_FIT"
+
+    _profile(root, "hcp-pr-acceptance-reviewer")
+    with pytest.raises(AssignmentRefusal, match="PROFILE_ROUTE_MISMATCH"):
+        route_assignment(
+            _request("hcp-pr-acceptance-reviewer"),
+            profiles_root=root,
+            run_id="assignment:007c:wrong",
+            provider="wrong-provider",
+            model="gpt-5.6-sol",
+            effort="high",
+            attempted_profile_id="hcp_assignment_only",
+        )
+
+
+def test_unknown_profile_identity_refuses_instead_of_selecting(tmp_path: Path) -> None:
+    from hermes_cli.hcp_assignment import AssignmentRefusal, route_assignment
+
+    root = tmp_path / "profiles"
+    root.mkdir()
+    with pytest.raises(AssignmentRefusal, match="PROFILE_CATALOG_INVALID"):
+        route_assignment(
+            _request("missing-profile"),
+            profiles_root=root,
+            run_id="assignment:007c:unknown",
+            provider="openai-codex",
+            model="gpt-5.6-sol",
+            effort="high",
+            attempted_profile_id="hcp_assignment_only",
+        )
+
+
+def test_hcp_assignment_is_a_closed_builtin_without_plugin_discovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sys
+    from hermes_cli import main as module
+
+    monkeypatch.setattr(sys, "argv", ["hermes", "hcp-assignment"])
+    assert module._plugin_cli_discovery_needed() is False
 
 
 def test_plugin_registers_only_the_assignment_cli_command() -> None:

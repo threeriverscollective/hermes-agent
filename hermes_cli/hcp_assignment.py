@@ -16,6 +16,8 @@ import stat
 import sys
 from typing import Any
 
+import yaml
+
 
 HCP_CLI_COMMAND = "hcp-assignment"
 HCP_AUXILIARY_TASK = "hcp_assignment_only"
@@ -33,6 +35,10 @@ _INPUT_KEYS = frozenset(
     }
 )
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
+_HCP_PROFILES = frozenset(
+    {"hcp-general-implementer", "hcp-pr-acceptance-reviewer"}
+)
+_HCP_ROUTE = ("openai-codex", "gpt-5.6-sol", "high")
 
 
 class AssignmentRefusal(ValueError):
@@ -111,7 +117,14 @@ def _profiles_root(value: object) -> Path:
     return path
 
 
-def _installed(root: Path, profile_id: str) -> bool:
+def _installed(
+    root: Path,
+    profile_id: str,
+    *,
+    provider: str,
+    model: str,
+    effort: str,
+) -> bool:
     path = root / profile_id
     try:
         metadata = os.lstat(path)
@@ -119,10 +132,74 @@ def _installed(root: Path, profile_id: str) -> bool:
         return False
     except OSError as error:
         raise AssignmentRefusal("PROFILE_CATALOG_INVALID") from error
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+    ):
+        return False
+    config_path = path / "config.yaml"
+    try:
+        before = os.lstat(config_path)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or stat.S_ISLNK(before.st_mode)
+            or before.st_uid != os.geteuid()
+            or stat.S_IMODE(before.st_mode) & 0o022
+            or before.st_size < 1
+            or before.st_size > 256 * 1024
+        ):
+            return False
+        descriptor = os.open(
+            config_path,
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+        try:
+            opened = os.fstat(descriptor)
+            if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+                return False
+            raw = os.read(descriptor, 256 * 1024 + 1)
+        finally:
+            os.close(descriptor)
+        after = os.lstat(config_path)
+        if (
+            (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+            != (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+            or len(raw) != before.st_size
+        ):
+            return False
+        class _UniqueLoader(yaml.SafeLoader):
+            pass
+
+        def _mapping(loader, node, deep=False):
+            result = {}
+            for key_node, value_node in node.value:
+                key = loader.construct_object(key_node, deep=deep)
+                if key in result:
+                    raise ValueError("duplicate YAML key")
+                result[key] = loader.construct_object(value_node, deep=deep)
+            return result
+
+        _UniqueLoader.add_constructor(
+            yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+            _mapping,
+        )
+        config = yaml.load(raw.decode("utf-8", errors="strict"), Loader=_UniqueLoader)
+    except (OSError, UnicodeError, ValueError, TypeError, yaml.YAMLError):
+        return False
+    if not isinstance(config, Mapping):
+        return False
+    model_row = config.get("model")
+    agent_row = config.get("agent")
     return (
-        stat.S_ISDIR(metadata.st_mode)
-        and not stat.S_ISLNK(metadata.st_mode)
-        and metadata.st_uid == os.geteuid()
+        isinstance(model_row, Mapping)
+        and isinstance(agent_row, Mapping)
+        and (model_row.get("default") or model_row.get("model")) == model
+        and model_row.get("provider") == provider
+        and agent_row.get("reasoning_effort") == effort
     )
 
 
@@ -149,9 +226,26 @@ def route_assignment(
     }
     if identity["attempted_profile_id"] != HCP_AUXILIARY_TASK:
         raise AssignmentRefusal("AUXILIARY_CONTEXT_MISMATCH")
+    if (
+        (identity["provider"], identity["model"], identity["effort"])
+        != _HCP_ROUTE
+    ):
+        raise AssignmentRefusal("PROFILE_ROUTE_MISMATCH")
     allowed = request["allowed_profile_ids"]
     assert isinstance(allowed, list)
-    installed = [profile_id for profile_id in allowed if _installed(root, profile_id)]
+    if any(profile_id not in _HCP_PROFILES for profile_id in allowed):
+        raise AssignmentRefusal("PROFILE_CATALOG_INVALID")
+    installed = [
+        profile_id
+        for profile_id in allowed
+        if _installed(
+            root,
+            profile_id,
+            provider=identity["provider"],
+            model=identity["model"],
+            effort=identity["effort"],
+        )
+    ]
     selection = installed[0] if len(allowed) == 1 and installed == allowed else NO_FIT
     encoded = json.dumps(
         request,
