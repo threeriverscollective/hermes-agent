@@ -23,6 +23,7 @@ import re
 import threading
 import time
 import uuid
+from collections.abc import Mapping
 from types import SimpleNamespace
 from typing import Any, Dict, Optional
 
@@ -471,6 +472,7 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
         sdk_request = canonical_sdk_request(api_kwargs)
         wire_request = canonical_model_request(sdk_request)
         expected_request_headers: dict[str, str] = {}
+        expected_client_headers: dict[str, str] = {}
         if agent.api_mode == "codex_responses":
             from agent.transports.codex import _bounded_prompt_cache_key
 
@@ -483,10 +485,42 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
                 "session_id": cache_scope,
                 "x-client-request-id": cache_scope,
             }
+            client_kwargs = getattr(agent, "_client_kwargs", None)
+            configured_headers = (
+                client_kwargs.get("default_headers")
+                if isinstance(client_kwargs, Mapping)
+                else None
+            )
+            if not isinstance(configured_headers, Mapping):
+                raise ProviderRequestBlocked(
+                    "PROVIDER_REQUEST_TRANSPORT_UNSUPPORTED"
+                )
+            for raw_name, raw_value in configured_headers.items():
+                if type(raw_name) is not str or type(raw_value) is not str:
+                    raise ProviderRequestBlocked(
+                        "PROVIDER_REQUEST_TRANSPORT_INVALID"
+                    )
+                name = raw_name.strip().lower()
+                if name in {"user-agent", "originator", "chatgpt-account-id"}:
+                    if name in expected_client_headers:
+                        raise ProviderRequestBlocked(
+                            "PROVIDER_REQUEST_TRANSPORT_INVALID"
+                        )
+                    expected_client_headers[name] = raw_value
+            if (
+                expected_client_headers.get("originator") != "codex_cli_rs"
+                or not expected_client_headers.get("user-agent", "").startswith(
+                    "codex_cli_rs/"
+                )
+            ):
+                raise ProviderRequestBlocked(
+                    "PROVIDER_REQUEST_TRANSPORT_UNSUPPORTED"
+                )
         endpoint, transport_identity_sha256 = client_transport_identity(
             request_client,
             expected_base_url=agent.base_url,
             expected_api_key=agent.api_key,
+            expected_client_headers=expected_client_headers,
             request_headers=api_kwargs.get("extra_headers"),
             expected_request_headers=expected_request_headers,
             request_query=api_kwargs.get("extra_query"),

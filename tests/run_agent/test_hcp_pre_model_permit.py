@@ -20,6 +20,17 @@ def _response(text: str = "ok") -> SimpleNamespace:
     )
 
 
+def _authorization(request_sha256: str):
+    from hermes_cli.provider_request_guard import ProviderRequestAuthorization
+
+    return ProviderRequestAuthorization(
+        authorization_id="test-only-authorization",
+        request_sha256=request_sha256,
+        subject_sha256="sha256:" + "2" * 64,
+        expires_at_monotonic=time.monotonic() + 30,
+    )
+
+
 @pytest.fixture()
 def agent() -> AIAgent:
     with (
@@ -70,14 +81,19 @@ def _provider_client(callback):
     )
 
 
-def _codex_provider_client(callback):
+def _codex_provider_client(callback, *, account_id: str | None = None):
+    default_headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Authorization": "Bearer test-only-key",
+        "User-Agent": "codex_cli_rs/0.0.0 (Hermes Agent)",
+        "originator": "codex_cli_rs",
+    }
+    if account_id is not None:
+        default_headers["ChatGPT-Account-ID"] = account_id
     return SimpleNamespace(
         base_url="https://chatgpt.com/backend-api/codex/",
-        default_headers={
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-            "Authorization": "Bearer test-only-key",
-        },
+        default_headers=default_headers,
         default_query={},
         responses=SimpleNamespace(create=lambda **kwargs: callback(kwargs)),
         close=lambda: None,
@@ -90,6 +106,12 @@ def _codex_target() -> SimpleNamespace:
         provider="openai-codex",
         api_key="test-only-key",
         base_url="https://chatgpt.com/backend-api/codex",
+        _client_kwargs={
+            "default_headers": {
+                "User-Agent": "codex_cli_rs/0.0.0 (Hermes Agent)",
+                "originator": "codex_cli_rs",
+            }
+        },
         _provider_request_guard_context={
             "task_id": "card-7",
             "turn_id": "turn-1",
@@ -277,6 +299,60 @@ def test_codex_guard_rejects_unbound_transport_header_before_provider(
             target,
             request,
             make_client=lambda _reason: _codex_provider_client(provider),
+        )
+
+    manager._provider_request_guard.assert_not_called()
+    provider.assert_not_called()
+
+
+def test_codex_guard_binds_real_cloudflare_and_account_headers(monkeypatch) -> None:
+    from agent.chat_completion_helpers import _dispatch_nonstreaming_api_request
+    from hermes_cli import plugins
+
+    account_id = "account-bound-007c"
+    manager = plugins.PluginManager()
+    manager._provider_request_guard_required = True
+    manager._provider_request_guard = MagicMock(
+        side_effect=lambda **kwargs: _authorization(kwargs["request_sha256"])
+    )
+    monkeypatch.setattr(plugins, "_plugin_manager", manager)
+    target = _codex_target()
+    target._client_kwargs["default_headers"]["ChatGPT-Account-ID"] = account_id
+    provider = MagicMock(return_value=_response())
+
+    _dispatch_nonstreaming_api_request(
+        target,
+        _codex_request(),
+        make_client=lambda _reason: _codex_provider_client(
+            provider, account_id=account_id
+        ),
+    )
+
+    provider.assert_called_once()
+    assert manager._provider_request_guard.call_args.kwargs[
+        "transport_identity_sha256"
+    ].startswith("sha256:")
+
+
+def test_codex_guard_rejects_cloudflare_header_rebinding(monkeypatch) -> None:
+    from agent.chat_completion_helpers import _dispatch_nonstreaming_api_request
+    from hermes_cli import plugins
+    from hermes_cli.provider_request_guard import ProviderRequestBlocked
+
+    manager = plugins.PluginManager()
+    manager._provider_request_guard_required = True
+    manager._provider_request_guard = MagicMock()
+    monkeypatch.setattr(plugins, "_plugin_manager", manager)
+    target = _codex_target()
+    provider = MagicMock()
+    client = _codex_provider_client(provider)
+    client.default_headers["originator"] = "codex_vscode"
+
+    with pytest.raises(ProviderRequestBlocked, match="TRANSPORT_UNSUPPORTED"):
+        _dispatch_nonstreaming_api_request(
+            target,
+            _codex_request(),
+            make_client=lambda _reason: client,
         )
 
     manager._provider_request_guard.assert_not_called()

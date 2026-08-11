@@ -28,9 +28,11 @@ _LOCAL_TRANSPORT_KEYS = frozenset({
 _ALLOWED_CLIENT_HEADER_NAMES = frozenset({
     "accept",
     "authorization",
+    "chatgpt-account-id",
     "content-type",
     "openai-organization",
     "openai-project",
+    "originator",
     "user-agent",
     "x-stainless-arch",
     "x-stainless-async",
@@ -167,6 +169,7 @@ def client_transport_identity(
     *,
     expected_base_url: str,
     expected_api_key: str,
+    expected_client_headers: Mapping[str, str] | None = None,
     request_headers: object = None,
     expected_request_headers: Mapping[str, str] | None = None,
     request_query: object = None,
@@ -215,6 +218,27 @@ def client_transport_identity(
         or normalized_headers.get("authorization") != f"Bearer {expected_api_key}"
     ):
         raise ProviderRequestBlocked("PROVIDER_REQUEST_CREDENTIAL_MISMATCH")
+    normalized_expected_client_headers: dict[str, str] = {}
+    for raw_name, raw_value in (expected_client_headers or {}).items():
+        if type(raw_name) is not str or type(raw_value) is not str:
+            raise ProviderRequestBlocked("PROVIDER_REQUEST_TRANSPORT_INVALID")
+        name = raw_name.strip().lower()
+        if (
+            not name
+            or name in normalized_expected_client_headers
+            or name not in _ALLOWED_CLIENT_HEADER_NAMES
+        ):
+            raise ProviderRequestBlocked("PROVIDER_REQUEST_TRANSPORT_INVALID")
+        normalized_expected_client_headers[name] = raw_value
+    managed_client_headers = frozenset({"originator", "chatgpt-account-id"})
+    if any(
+        normalized_headers.get(name) != value
+        for name, value in normalized_expected_client_headers.items()
+    ) or any(
+        name in normalized_headers and name not in normalized_expected_client_headers
+        for name in managed_client_headers
+    ):
+        raise ProviderRequestBlocked("PROVIDER_REQUEST_TRANSPORT_UNSUPPORTED")
     if request_query not in (None, {}) or (
         isinstance(request_query, Mapping) and len(request_query) != 0
     ):
