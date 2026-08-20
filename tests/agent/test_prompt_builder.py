@@ -809,6 +809,9 @@ class TestEnvironmentHints:
         _pb._clear_backend_probe_cache()
 
         class _FakeEnv:
+            cleanup_force_remove = None
+            cleanup_wait_timeout = None
+
             def execute(self, cmd, timeout=None):
                 return {
                     "returncode": 0,
@@ -818,11 +821,19 @@ class TestEnvironmentHints:
                     ),
                 }
 
+            def cleanup(self, *, force_remove=False):
+                self.cleanup_force_remove = force_remove
+
+            def wait_for_cleanup(self, timeout=None):
+                self.cleanup_wait_timeout = timeout
+                return True
+
         created = {}
 
         def _fake_create_environment(*, env_type, **kwargs):
             created["env_type"] = env_type
-            return _FakeEnv()
+            created["env"] = _FakeEnv()
+            return created["env"]
 
         # Patch the REAL factory in tools.terminal_tool — the probe imports it
         # locally, so the import itself must succeed (the bug was here).
@@ -834,6 +845,8 @@ class TestEnvironmentHints:
         assert line is not None
         assert "Linux 6.8.0" in line
         assert "root" in line
+        assert created["env"].cleanup_force_remove is True
+        assert created["env"].cleanup_wait_timeout == 30.0
 
 
     def test_environment_hint_from_env_var_is_appended(self, monkeypatch):
@@ -988,5 +1001,3 @@ class TestParallelToolCallGuidance:
 # =========================================================================
 # Budget warning history stripping
 # =========================================================================
-
-

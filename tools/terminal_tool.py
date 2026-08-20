@@ -2240,6 +2240,11 @@ def cleanup_vm(task_id: str, *, force_remove: bool = False):
                 env.cleanup(force_remove=force_remove)
             else:
                 env.cleanup()
+            wait_fn = getattr(env, "wait_for_cleanup", None)
+            if callable(wait_fn) and wait_fn(timeout=30.0) is not True:
+                logger.warning(
+                    "Environment cleanup did not finish for task %s", task_id
+                )
         elif hasattr(env, 'stop'):
             env.stop()
         elif hasattr(env, 'terminate'):

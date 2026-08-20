@@ -40,6 +40,32 @@ def test_cgroup_capability_probe_is_always_airgapped(monkeypatch):
     assert commands[0][1:4] == ["run", "--rm", "--network=none"]
 
 
+def test_cleanup_vm_waits_for_invocation_owned_docker_removal(monkeypatch):
+    class FakeEnvironment:
+        cleaned = False
+        waited = None
+
+        def cleanup(self, *, force_remove=False):
+            self.cleaned = force_remove is False
+
+        def wait_for_cleanup(self, timeout=None):
+            self.waited = timeout
+            return True
+
+    environment = FakeEnvironment()
+    monkeypatch.setitem(
+        terminal_tool._active_environments,
+        "cleanup-wait-test",
+        environment,
+    )
+
+    terminal_tool.cleanup_vm("cleanup-wait-test")
+
+    assert environment.cleaned is True
+    assert environment.waited == 30.0
+    assert "cleanup-wait-test" not in terminal_tool._active_environments
+
+
 def test_sibling_container_config_sites_carry_docker_network():
     """Every container_config dict that carries docker_run_as_host_user must
     also carry docker_network — otherwise that code path silently falls back

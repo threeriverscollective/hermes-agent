@@ -1195,6 +1195,7 @@ def _probe_remote_backend(env_type: str) -> str | None:
         _BACKEND_PROBE_CACHE[cache_key] = ""
         return None
 
+    env = None
     try:
         config = _get_env_config()
         # Build the environment the same way tools/terminal_tool.py does for a
@@ -1273,6 +1274,26 @@ def _probe_remote_backend(env_type: str) -> str | None:
         logger.debug("Backend probe failed: %s", e)
         _BACKEND_PROBE_CACHE[cache_key] = ""
         return None
+    finally:
+        if env is not None:
+            cleanup = getattr(env, "cleanup", None)
+            if callable(cleanup):
+                try:
+                    import inspect
+
+                    parameters = inspect.signature(cleanup).parameters
+                    if "force_remove" in parameters:
+                        cleanup(force_remove=True)
+                    else:
+                        cleanup()
+                except Exception as error:
+                    logger.debug("Backend probe cleanup failed: %s", error)
+            wait_for_cleanup = getattr(env, "wait_for_cleanup", None)
+            if callable(wait_for_cleanup):
+                try:
+                    wait_for_cleanup(timeout=30.0)
+                except Exception as error:
+                    logger.debug("Backend probe cleanup wait failed: %s", error)
 
     # Parse key=value lines back into a tidy summary.
     parsed: dict[str, str] = {}
