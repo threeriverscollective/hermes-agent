@@ -10,6 +10,8 @@ import threading
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
+from model_tools import _clear_tool_defs_cache, get_tool_definitions
+
 from tools.hcp_diagnostics_read_tool import (
     CONFIG_SCHEMA_VERSION,
     HCP_DIAGNOSTICS_READ_SCHEMA,
@@ -166,6 +168,37 @@ def test_tool_inventory_is_one_pinned_opt_in_toolset() -> None:
     assert entry is not None
     assert entry.toolset == "hcp_diagnostics"
     assert entry.schema == HCP_DIAGNOSTICS_READ_SCHEMA
+
+
+def test_first_pilot_inventory_is_exact_terminal_plus_host_diagnostics(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config_path, _, _, _ = _binding(tmp_path)
+    monkeypatch.setenv("HCP_DIAGNOSTICS_TOOL_CONFIG", str(config_path))
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    _clear_tool_defs_cache()
+    try:
+        exposed = get_tool_definitions(
+            enabled_toolsets=["terminal", "hcp_diagnostics"],
+            quiet_mode=True,
+            skip_tool_search_assembly=True,
+        )
+        without_diagnostics = get_tool_definitions(
+            enabled_toolsets=["terminal"],
+            quiet_mode=True,
+            skip_tool_search_assembly=True,
+        )
+    finally:
+        _clear_tool_defs_cache()
+    assert sorted(row["function"]["name"] for row in exposed) == [
+        "hcp_diagnostics_read",
+        "process",
+        "terminal",
+    ]
+    assert sorted(row["function"]["name"] for row in without_diagnostics) == [
+        "process",
+        "terminal",
+    ]
 
 
 def test_tool_crosses_private_socket_with_host_injected_authority(
