@@ -311,6 +311,15 @@ TOOLSETS = {
         "includes": []
     },
 
+    "hcp_diagnostics": {
+        "description": (
+            "HCP-admitted repository-scoped diagnostic reads over a private "
+            "authenticated host bridge"
+        ),
+        "tools": ["hcp_diagnostics_read"],
+        "includes": [],
+    },
+
     "kanban": {
         "description": (
             "Kanban multi-agent coordination — only active when the agent "
