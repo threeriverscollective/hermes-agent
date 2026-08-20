@@ -18,6 +18,28 @@ def test_terminal_env_config_reads_docker_network_toggle(monkeypatch):
     assert config["docker_network"] is False
 
 
+def test_cgroup_capability_probe_is_always_airgapped(monkeypatch):
+    commands = []
+
+    def fake_run(cmd, *args, **kwargs):
+        commands.append(cmd)
+
+        class Result:
+            returncode = 0
+            stderr = ""
+            stdout = ""
+
+        return Result()
+
+    monkeypatch.setattr(docker_env, "_cgroup_limits_ok", None)
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(docker_env.subprocess, "run", fake_run)
+
+    assert docker_env._cgroup_limits_available("worker-image") is True
+    assert len(commands) == 1
+    assert commands[0][1:4] == ["run", "--rm", "--network=none"]
+
+
 def test_sibling_container_config_sites_carry_docker_network():
     """Every container_config dict that carries docker_run_as_host_user must
     also carry docker_network — otherwise that code path silently falls back

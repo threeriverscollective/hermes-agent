@@ -745,6 +745,7 @@ def _cgroup_limits_available(image: str) -> bool:
     try:
         result = subprocess.run(
             [docker_exe, "run", "--rm",
+             "--network=none",
              "--cpus", "0.5", "--memory", "64m", "--pids-limit", "32",
              image, "sleep", "0"],
             capture_output=True,
