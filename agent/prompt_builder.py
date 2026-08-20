@@ -1237,6 +1237,7 @@ def _probe_remote_backend(env_type: str) -> str | None:
                 "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
                 "docker_extra_args": config.get("docker_extra_args", []),
                 "docker_shm_size": config.get("docker_shm_size", "1g"),
+                "docker_network": config.get("docker_network", True),
                 "docker_persist_across_processes": config.get("docker_persist_across_processes", True),
                 "docker_orphan_reaper": config.get("docker_orphan_reaper", True),
             }
