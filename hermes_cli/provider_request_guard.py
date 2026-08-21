@@ -187,6 +187,32 @@ def _identity_text(value: object) -> str:
     return value
 
 
+def bound_provider_response_task_id(
+    context: object,
+    *,
+    session_id: object,
+    turn_id: object,
+    api_request_id: object,
+) -> str:
+    """Return the task identity already bound to this authorized response.
+
+    Fail closed when the guard context or any identity is absent, empty,
+    malformed, or not this response. Callers must not fall back to a random
+    one-shot task id or re-read process environment at tool execution time.
+    """
+
+    if type(context) is not dict:
+        raise ProviderRequestBlocked("PROVIDER_REQUEST_CONTEXT_UNAVAILABLE")
+    task_id = _identity_text(context.get("task_id"))
+    if (
+        _identity_text(context.get("session_id")) != _identity_text(session_id)
+        or _identity_text(context.get("turn_id")) != _identity_text(turn_id)
+        or _identity_text(context.get("api_request_id")) != _identity_text(api_request_id)
+    ):
+        raise ProviderRequestBlocked("PROVIDER_REQUEST_CONTEXT_UNAVAILABLE")
+    return task_id
+
+
 def begin_provider_request_authorization(
     *,
     task_id: object,
@@ -669,6 +695,7 @@ __all__ = [
     "ProviderToolInvocationAttestation",
     "begin_provider_request_authorization",
     "bind_provider_response_tool_calls",
+    "bound_provider_response_task_id",
     "client_transport_identity",
     "canonical_request_sha256",
     "canonical_sdk_request",

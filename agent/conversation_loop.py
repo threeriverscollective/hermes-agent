@@ -7132,21 +7132,29 @@ def run_conversation(
                 _guard_context = getattr(
                     agent, "_provider_request_guard_context", None
                 )
+                _execution_task_id = effective_task_id
+                _discard_authorization = None
                 if provider_request_guard_active():
-                    if not isinstance(_guard_context, dict):
-                        raise ProviderRequestBlocked(
-                            "PROVIDER_REQUEST_CONTEXT_UNAVAILABLE"
-                        )
                     from hermes_cli.provider_request_guard import (
                         bind_provider_response_tool_calls,
+                        bound_provider_response_task_id,
                         discard_provider_request_authorization,
                     )
 
+                    _execution_task_id = bound_provider_response_task_id(
+                        _guard_context,
+                        session_id=agent.session_id or "",
+                        turn_id=turn_id,
+                        api_request_id=api_request_id,
+                    )
+                    _discard_authorization = {
+                        "task_id": _execution_task_id,
+                        "session_id": agent.session_id or "",
+                        "turn_id": turn_id,
+                        "api_request_id": api_request_id,
+                    }
                     bind_provider_response_tool_calls(
-                        task_id=_guard_context.get("task_id"),
-                        session_id=_guard_context.get("session_id"),
-                        turn_id=_guard_context.get("turn_id"),
-                        api_request_id=_guard_context.get("api_request_id"),
+                        **_discard_authorization,
                         tool_calls=[
                             (
                                 tc.id,
@@ -7165,18 +7173,13 @@ def run_conversation(
                     agent._execute_tool_calls(
                         assistant_message,
                         messages,
-                        effective_task_id,
+                        _execution_task_id,
                         api_call_count,
                     )
                 finally:
-                    if provider_request_guard_active() and isinstance(
-                        _guard_context, dict
-                    ):
+                    if _discard_authorization is not None:
                         discard_provider_request_authorization(
-                            task_id=_guard_context.get("task_id"),
-                            session_id=_guard_context.get("session_id"),
-                            turn_id=_guard_context.get("turn_id"),
-                            api_request_id=_guard_context.get("api_request_id"),
+                            **_discard_authorization
                         )
 
                 if getattr(agent, "_incremental_persistence_failed", False):

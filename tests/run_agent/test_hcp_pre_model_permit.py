@@ -781,3 +781,298 @@ def test_guard_cannot_mutate_the_authorized_request_before_transport(
         )
     provider.assert_not_called()
     assert payload["messages"][0]["content"] == "exact"
+
+
+def _tool_call_response(*, name: str, arguments: str, call_id: str):
+    message = SimpleNamespace(
+        content="",
+        tool_calls=[
+            SimpleNamespace(
+                id=call_id,
+                type="function",
+                function=SimpleNamespace(name=name, arguments=arguments),
+            )
+        ],
+    )
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=message, finish_reason="tool_calls")],
+        model="test/model",
+        usage=None,
+    )
+
+
+def _install_required_guard(monkeypatch, *, bind_response=None):
+    from hermes_cli import plugins
+    from hermes_cli.provider_request_guard import (
+        ProviderRequestAuthorization,
+        canonical_request_sha256,
+    )
+
+    manager = plugins.PluginManager()
+    manager._provider_request_guard_required = True
+    permits: list[dict[str, object]] = []
+    bindings: list[dict[str, object]] = []
+
+    def allow(**kwargs):
+        permits.append(kwargs)
+        return ProviderRequestAuthorization(
+            authorization_id=f"test-only-authorization-{len(permits)}",
+            request_sha256=kwargs["request_sha256"],
+            subject_sha256="sha256:" + "6" * 64,
+            expires_at_monotonic=time.monotonic() + 30,
+        )
+
+    def default_bind(**binding):
+        bindings.append(binding)
+        return {
+            "binding_sha256": canonical_request_sha256(binding),
+            "binding_receipt_id": f"binding-receipt:{len(bindings)}",
+        }
+
+    allow.bind_provider_response = bind_response or default_bind
+    manager._provider_request_guard = allow
+    monkeypatch.setattr(plugins, "_plugin_manager", manager)
+    return permits, bindings
+
+
+def _run_tool_conversation(agent, *, task_id=None):
+    with (
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+        patch(
+            "run_agent.handle_function_call",
+            side_effect=lambda *args, **kwargs: "tool-result",
+        ) as handle,
+    ):
+        result = agent.run_conversation("read the offer", task_id=task_id)
+    return result, handle
+
+
+def test_guarded_tool_dispatch_receives_the_bound_managed_task(
+    agent, monkeypatch
+) -> None:
+    from hermes_cli.provider_request_guard import _PROVIDER_RESPONSE_LEDGER
+
+    managed_task = "card:run:real-model"
+    monkeypatch.setenv("HERMES_KANBAN_TASK", managed_task)
+    agent.valid_tool_names.add("hcp_diagnostics_read")
+    permits, bindings = _install_required_guard(monkeypatch)
+    provider_calls: list[object] = []
+
+    def provider(_request):
+        provider_calls.append(_request)
+        if len(provider_calls) == 1:
+            return _tool_call_response(
+                name="hcp_diagnostics_read",
+                arguments='{"offer_id":"diagnostic-offer:3dd52387ec137a90db578c0ade184ad41026f67cc79fb3cabd1da2f211e94e8f"}',
+                call_id="call:diagnostics:1",
+            )
+        return _response("done")
+
+    client = _provider_client(provider)
+    monkeypatch.setattr(
+        agent, "_create_request_openai_client", lambda **_kwargs: client
+    )
+
+    result, handle = _run_tool_conversation(agent, task_id="one-shot-random")
+
+    assert result["completed"] is True
+    assert result["final_response"] == "done"
+    assert handle.call_count == 1
+    assert handle.call_args.args[2] == managed_task
+    assert handle.call_args.args[2] != "one-shot-random"
+    assert permits
+    assert bindings
+    assert {row["task_id"] for row in permits} == {managed_task}
+    assert {row["task_id"] for row in bindings} == {managed_task}
+    bound = bindings[0]
+    disposed_key = (
+        bound["task_id"],
+        bound["session_id"],
+        bound["turn_id"],
+        bound["api_request_id"],
+    )
+    assert disposed_key not in _PROVIDER_RESPONSE_LEDGER
+
+
+def test_guarded_tool_dispatch_does_not_reread_kanban_task_env(
+    agent, monkeypatch
+) -> None:
+    managed_task = "card:run:real-model"
+    monkeypatch.setenv("HERMES_KANBAN_TASK", managed_task)
+    agent.valid_tool_names.add("hcp_diagnostics_read")
+    _install_required_guard(monkeypatch)
+    provider_calls: list[object] = []
+
+    def provider(_request):
+        provider_calls.append(_request)
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "card:attacker")
+        if len(provider_calls) == 1:
+            return _tool_call_response(
+                name="hcp_diagnostics_read",
+                arguments='{"offer_id":"diagnostic-offer:3dd52387ec137a90db578c0ade184ad41026f67cc79fb3cabd1da2f211e94e8f"}',
+                call_id="call:diagnostics:1",
+            )
+        return _response("done")
+
+    client = _provider_client(provider)
+    monkeypatch.setattr(
+        agent, "_create_request_openai_client", lambda **_kwargs: client
+    )
+
+    result, handle = _run_tool_conversation(agent, task_id="one-shot-random")
+
+    assert result["completed"] is True
+    assert handle.call_args.args[2] == managed_task
+    assert handle.call_args.args[2] != "card:attacker"
+
+
+def test_unguarded_tool_dispatch_receives_effective_task_id(
+    agent, monkeypatch
+) -> None:
+    from hermes_cli import plugins
+
+    monkeypatch.setattr(plugins, "_plugin_manager", plugins.PluginManager())
+    agent.valid_tool_names.add("web_search")
+    provider_calls: list[object] = []
+
+    def provider(_request):
+        provider_calls.append(_request)
+        if len(provider_calls) == 1:
+            return _tool_call_response(
+                name="web_search",
+                arguments="{}",
+                call_id="call:search:1",
+            )
+        return _response("ordinary")
+
+    client = _provider_client(provider)
+    monkeypatch.setattr(
+        agent, "_create_request_openai_client", lambda **_kwargs: client
+    )
+
+    result, handle = _run_tool_conversation(agent, task_id="explicit-one-shot")
+
+    assert result["completed"] is True
+    assert result["final_response"] == "ordinary"
+    assert handle.call_count == 1
+    assert handle.call_args.args[2] == "explicit-one-shot"
+
+
+@pytest.mark.parametrize(
+    "invalid_task_id",
+    ["", "   ", None, 7, "card:other"],
+)
+def test_invalid_guarded_task_identity_cannot_execute_a_tool(
+    agent, monkeypatch, invalid_task_id
+) -> None:
+    from hermes_cli.provider_request_guard import ProviderRequestBlocked
+
+    managed_task = "card:run:real-model"
+    monkeypatch.setenv("HERMES_KANBAN_TASK", managed_task)
+    agent.valid_tool_names.add("hcp_diagnostics_read")
+    _install_required_guard(monkeypatch)
+    provider_calls: list[object] = []
+
+    def provider(_request):
+        provider_calls.append(_request)
+        context = getattr(agent, "_provider_request_guard_context", None)
+        assert isinstance(context, dict)
+        context["task_id"] = invalid_task_id
+        return _tool_call_response(
+            name="hcp_diagnostics_read",
+            arguments='{"offer_id":"diagnostic-offer:3dd52387ec137a90db578c0ade184ad41026f67cc79fb3cabd1da2f211e94e8f"}',
+            call_id="call:diagnostics:1",
+        )
+
+    client = _provider_client(provider)
+    monkeypatch.setattr(
+        agent, "_create_request_openai_client", lambda **_kwargs: client
+    )
+    handle = MagicMock(return_value="must-not-run")
+
+    with (
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+        patch("run_agent.handle_function_call", handle),
+        pytest.raises(
+            ProviderRequestBlocked,
+            match="PROVIDER_REQUEST_CONTEXT_UNAVAILABLE|PROVIDER_RESPONSE_UNATTESTED",
+        ),
+    ):
+        agent.run_conversation("read the offer", task_id="one-shot-random")
+
+    handle.assert_not_called()
+
+
+def test_stale_guard_context_cannot_execute_a_tool(agent, monkeypatch) -> None:
+    from hermes_cli.provider_request_guard import ProviderRequestBlocked
+
+    managed_task = "card:run:real-model"
+    monkeypatch.setenv("HERMES_KANBAN_TASK", managed_task)
+    agent.valid_tool_names.add("hcp_diagnostics_read")
+    _install_required_guard(monkeypatch)
+
+    def provider(_request):
+        context = getattr(agent, "_provider_request_guard_context", None)
+        assert isinstance(context, dict)
+        context["turn_id"] = "previous-response-turn"
+        context["api_request_id"] = "previous-response-api"
+        return _tool_call_response(
+            name="hcp_diagnostics_read",
+            arguments='{"offer_id":"diagnostic-offer:3dd52387ec137a90db578c0ade184ad41026f67cc79fb3cabd1da2f211e94e8f"}',
+            call_id="call:diagnostics:1",
+        )
+
+    client = _provider_client(provider)
+    monkeypatch.setattr(
+        agent, "_create_request_openai_client", lambda **_kwargs: client
+    )
+    handle = MagicMock(return_value="must-not-run")
+
+    with (
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+        patch("run_agent.handle_function_call", handle),
+        pytest.raises(ProviderRequestBlocked, match="CONTEXT_UNAVAILABLE"),
+    ):
+        agent.run_conversation("read the offer", task_id="one-shot-random")
+
+    handle.assert_not_called()
+
+
+def test_missing_guard_context_cannot_execute_a_tool(agent, monkeypatch) -> None:
+    from hermes_cli.provider_request_guard import ProviderRequestBlocked
+
+    managed_task = "card:run:real-model"
+    monkeypatch.setenv("HERMES_KANBAN_TASK", managed_task)
+    agent.valid_tool_names.add("hcp_diagnostics_read")
+    _install_required_guard(monkeypatch)
+
+    def provider(_request):
+        agent._provider_request_guard_context = None
+        return _tool_call_response(
+            name="hcp_diagnostics_read",
+            arguments='{"offer_id":"diagnostic-offer:3dd52387ec137a90db578c0ade184ad41026f67cc79fb3cabd1da2f211e94e8f"}',
+            call_id="call:diagnostics:1",
+        )
+
+    client = _provider_client(provider)
+    monkeypatch.setattr(
+        agent, "_create_request_openai_client", lambda **_kwargs: client
+    )
+    handle = MagicMock(return_value="must-not-run")
+
+    with (
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+        patch("run_agent.handle_function_call", handle),
+        pytest.raises(ProviderRequestBlocked, match="CONTEXT_UNAVAILABLE"),
+    ):
+        agent.run_conversation("read the offer", task_id="one-shot-random")
+
+    handle.assert_not_called()
