@@ -142,7 +142,7 @@ def _authorize(identity: dict[str, str] = IDENTITY) -> None:
     bind_provider_response_tool_calls(
         **request_identity,
         tool_calls=[
-            (identity["tool_call_id"], TOOL_NAME, '{"offer_id":"offer:1"}')
+            (identity["tool_call_id"], TOOL_NAME, '{"offer_id":"diagnostic-offer:1111111111111111111111111111111111111111111111111111111111111111"}')
         ],
         finish_reason="tool_calls",
         assistant_content="",
@@ -272,7 +272,7 @@ def test_cross_repository_offer_argument_digest_vector_is_exact(monkeypatch) -> 
             "tool_call_id": "call:1",
             "tool_name": "hcp_diagnostics_read",
             "arguments_sha256": (
-                "sha256:a36609ff6956e75be3de9368842ae11618ac1dccecd30c337bda02665abae1d0"
+                "sha256:2e2201f66544a45d32ae9866e6e02bd86a8bc9f3fed70ec69e90dca5a401956c"
             ),
         }
     ]
@@ -347,7 +347,7 @@ def test_tool_crosses_socket_with_host_identity_and_provider_attestation(
     )
 
     result = json.loads(
-        hcp_diagnostics_read_tool({"offer_id": "offer:1"}, **IDENTITY)
+        hcp_diagnostics_read_tool({"offer_id": "diagnostic-offer:1111111111111111111111111111111111111111111111111111111111111111"}, **IDENTITY)
     )
     thread.join(timeout=3)
 
@@ -360,7 +360,7 @@ def test_tool_crosses_socket_with_host_identity_and_provider_attestation(
     assert request["repository_id"] == "repository-a"
     assert request["card_id"] == "card:1"
     assert request["run_id"] == "run:1"
-    assert request["offer_id"] == "offer:1"
+    assert request["offer_id"] == "diagnostic-offer:1111111111111111111111111111111111111111111111111111111111111111"
     assert {key: request[key] for key in IDENTITY} == IDENTITY
     assert request["provider_authorization_id"] == "permit:1"
     assert request["provider_request_sha256"] == "sha256:" + "a" * 64
@@ -381,7 +381,7 @@ def test_model_authored_authority_is_rejected_before_socket_access(
     monkeypatch.setenv("HCP_DIAGNOSTICS_TOOL_CONFIG", str(config_path))
     result = json.loads(
         hcp_diagnostics_read_tool(
-            {"offer_id": "offer:1", "repository_id": "repository-b"},
+            {"offer_id": "diagnostic-offer:1111111111111111111111111111111111111111111111111111111111111111", "repository_id": "repository-b"},
             **IDENTITY,
         )
     )
@@ -395,7 +395,7 @@ def test_direct_tool_call_without_authorized_response_is_refused_before_socket(
     monkeypatch.setenv("HCP_DIAGNOSTICS_TOOL_CONFIG", str(config_path))
     _discard()
     result = json.loads(
-        hcp_diagnostics_read_tool({"offer_id": "offer:1"}, **IDENTITY)
+        hcp_diagnostics_read_tool({"offer_id": "diagnostic-offer:1111111111111111111111111111111111111111111111111111111111111111"}, **IDENTITY)
     )
     assert result["error_code"] == "BROKER_TRANSPORT_AUTH_INVALID"
 
@@ -444,7 +444,7 @@ def test_slow_authentic_response_can_bind_after_initiation_permit_expires() -> N
     bind_provider_response_tool_calls(
         **request_identity,
         tool_calls=[
-            (IDENTITY["tool_call_id"], TOOL_NAME, '{"offer_id":"offer:1"}')
+            (IDENTITY["tool_call_id"], TOOL_NAME, '{"offer_id":"diagnostic-offer:1111111111111111111111111111111111111111111111111111111111111111"}')
         ],
         finish_reason="tool_calls",
         assistant_content="",
@@ -475,7 +475,7 @@ def test_retry_cannot_authorize_an_earlier_tool_call() -> None:
     bind_provider_response_tool_calls(
         **request_identity,
         tool_calls=[
-            (retry["tool_call_id"], TOOL_NAME, '{"offer_id":"offer:1"}')
+            (retry["tool_call_id"], TOOL_NAME, '{"offer_id":"diagnostic-offer:1111111111111111111111111111111111111111111111111111111111111111"}')
         ],
         finish_reason="tool_calls",
         assistant_content="",
@@ -507,8 +507,8 @@ def test_duplicate_pre_uniquify_ids_refuse_but_post_uniquify_ids_bind() -> None:
         bind_provider_response_tool_calls(
             **request_identity,
             tool_calls=[
-                ("call:dup", TOOL_NAME, '{"offer_id":"offer:1"}'),
-                ("call:dup", TOOL_NAME, '{"offer_id":"offer:1"}'),
+                ("call:dup", TOOL_NAME, '{"offer_id":"diagnostic-offer:1111111111111111111111111111111111111111111111111111111111111111"}'),
+                ("call:dup", TOOL_NAME, '{"offer_id":"diagnostic-offer:1111111111111111111111111111111111111111111111111111111111111111"}'),
             ],
             finish_reason="tool_calls",
             assistant_content="",
@@ -521,8 +521,8 @@ def test_duplicate_pre_uniquify_ids_refuse_but_post_uniquify_ids_bind() -> None:
     bind_provider_response_tool_calls(
         **request_identity,
         tool_calls=[
-            ("call:dup", TOOL_NAME, '{"offer_id":"offer:1"}'),
-            ("call:dup:2", TOOL_NAME, '{"offer_id":"offer:1"}'),
+            ("call:dup", TOOL_NAME, '{"offer_id":"diagnostic-offer:1111111111111111111111111111111111111111111111111111111111111111"}'),
+            ("call:dup:2", TOOL_NAME, '{"offer_id":"diagnostic-offer:1111111111111111111111111111111111111111111111111111111111111111"}'),
         ],
         finish_reason="tool_calls",
         assistant_content="",
@@ -557,7 +557,7 @@ def test_parallel_tool_calls_are_independently_atomic_and_nonreplayable() -> Non
     bind_provider_response_tool_calls(
         **request_identity,
         tool_calls=[
-            (call_id, TOOL_NAME, '{"offer_id":"offer:1"}')
+            (call_id, TOOL_NAME, '{"offer_id":"diagnostic-offer:1111111111111111111111111111111111111111111111111111111111111111"}')
             for call_id in call_ids
         ],
         finish_reason="tool_calls",
@@ -591,7 +591,7 @@ def test_wrong_hcp_response_signature_is_never_delivered(
         invalid_signature=True,
     )
     result = json.loads(
-        hcp_diagnostics_read_tool({"offer_id": "offer:1"}, **IDENTITY)
+        hcp_diagnostics_read_tool({"offer_id": "diagnostic-offer:1111111111111111111111111111111111111111111111111111111111111111"}, **IDENTITY)
     )
     thread.join(timeout=3)
     assert result["error_code"] == "BROKER_TRANSPORT_AUTH_INVALID"

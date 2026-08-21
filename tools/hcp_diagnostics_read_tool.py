@@ -37,6 +37,7 @@ _CONFIG_ENV = "HCP_DIAGNOSTICS_TOOL_CONFIG"
 _MAX_REQUEST_BYTES = 64 * 1024
 _MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 _TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+\-]{0,255}\Z")
+_DIAGNOSTIC_OFFER = re.compile(r"diagnostic-offer:[0-9a-f]{64}\Z")
 _SHA256 = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _INPUT_KEYS = frozenset({"offer_id"})
 _CONFIG_KEYS = frozenset(
@@ -147,6 +148,12 @@ def _strict_json(raw: bytes, *, limit: int) -> dict[str, object]:
 
 def _token(value: object) -> str:
     if type(value) is not str or _TOKEN.fullmatch(value) is None:
+        raise HcpDiagnosticsToolRefusal("BROKER_TRANSPORT_AUTH_INVALID")
+    return value
+
+
+def _diagnostic_offer(value: object) -> str:
+    if type(value) is not str or _DIAGNOSTIC_OFFER.fullmatch(value) is None:
         raise HcpDiagnosticsToolRefusal("BROKER_TRANSPORT_AUTH_INVALID")
     return value
 
@@ -354,7 +361,7 @@ def _execute(
         "repository_id": binding["repository_id"],
         "card_id": binding["card_id"],
         "run_id": binding["run_id"],
-        "offer_id": _token(value["offer_id"]),
+        "offer_id": _diagnostic_offer(value["offer_id"]),
         **invocation,
         **provider_attestation,
         "signing_identity": signing["signing_identity"],
