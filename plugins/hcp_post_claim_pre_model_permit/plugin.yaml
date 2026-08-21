@@ -1,0 +1,15 @@
+name: hcp_post_claim_pre_model_permit
+version: 1.0.0
+kind: backend
+description: "Fail-closed HCP permit bridge after Hermes claim/profile selection and immediately before provider transport."
+author: "NousResearch"
+requires_env:
+  - HCP_PRE_MODEL_PERMIT_SOCKET
+  - HCP_PRE_MODEL_PERMIT_MANIFEST_FD
+  - HCP_PRE_MODEL_PERMIT_PEER_PRIVATE_KEY_FD
+  - HCP_PRE_MODEL_PERMIT_SERVER_PUBLIC_KEY_FD
+  - HERMES_KANBAN_TASK
+  - HERMES_KANBAN_RUN_ID
+  - HERMES_KANBAN_CLAIM_LOCK
+  - HERMES_KANBAN_BOARD
+  - HERMES_PROFILE

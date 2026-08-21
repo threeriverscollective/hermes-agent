@@ -44,6 +44,7 @@ import logging
 import os
 import queue
 import re
+import stat
 import sys
 import threading
 import types
@@ -71,6 +72,20 @@ from hermes_cli.plugin_capabilities import (  # noqa: F401 — re-exported
 from hermes_cli.plugin_capabilities import (
     parse_declared_capabilities as _parse_declared_capabilities,
 )
+
+
+_HCP_PROVIDER_GUARD_PLUGIN = "hcp_post_claim_pre_model_permit"
+_HCP_PROVIDER_GUARD_FILES: dict[str, str] = {
+    "__init__.py": "c0a3678822614e0fb3dbd3d193b839a0f729ec21c915f71e2c0a6d5fc0e3bc9a",
+    "channel.py": "a2c4ab14149bdabd6d1b8dce03d7ad3a37ff25d6c0e44f3faf27f08f76e75f50",
+    "plugin.yaml": "b5a44bb3cdef47559b7b533dd8bf1671861e572b52bb2003eba539fae6282d5c",
+}
+
+
+def _required_hcp_plugin_dir() -> Path:
+    """Return the package-owned HCP plugin path, ignoring path overrides."""
+
+    return Path(__file__).resolve().parent.parent / "plugins" / _HCP_PROVIDER_GUARD_PLUGIN
 
 
 def get_bundled_plugins_dir() -> Path:
@@ -1388,9 +1403,18 @@ class PluginState:
 class PluginContext:
     """Facade given to plugins so they can register tools and hooks."""
 
-    def __init__(self, manifest: PluginManifest, manager: "PluginManager"):
+    def __init__(
+        self,
+        manifest: PluginManifest,
+        manager: "PluginManager",
+        *,
+        provider_guard_registration_capability: object | None = None,
+    ):
         self.manifest = manifest
         self._manager = manager
+        self.__provider_guard_registration_capability = (
+            provider_guard_registration_capability
+        )
         # Lazy-built host-owned LLM facade — see ctx.llm property below.
         self._llm: Any = None
         self._subagent_lifecycle: Any = None
@@ -3131,6 +3155,15 @@ class PluginContext:
         logger.debug("Plugin %s registered hook: %s", self.manifest.name, hook_name)
         return handle
 
+    def register_provider_request_guard(self, callback: Callable) -> None:
+        """Register the sole fail-closed guard immediately before provider I/O."""
+
+        self._manager.register_provider_request_guard(
+            callback,
+            owner=self.manifest.key or self.manifest.name,
+            capability=self.__provider_guard_registration_capability,
+        )
+
     def register_system_prompt_section(
         self,
         id: str,
@@ -3398,6 +3431,15 @@ class PluginManager:
         self._plugins: Dict[str, LoadedPlugin] = {}
         self._hooks: Dict[str, List[Callable]] = {}
         self._middleware: Dict[str, List[Callable]] = {}
+        self._provider_request_guard: Optional[Callable] = None
+        self._provider_request_guard_owner: Optional[str] = None
+        self.__provider_guard_registration_capability = object()
+        self._provider_request_guard_required = bool(
+            os.environ.get("HCP_PRE_MODEL_PERMIT_SOCKET")
+            or os.environ.get("HCP_PRE_MODEL_PERMIT_ROOT_FD")
+            or os.environ.get("HCP_PRE_MODEL_PERMIT_MANIFEST_FD")
+            or env_var_enabled("HCP_PRE_MODEL_PERMIT_REQUIRED")
+        )
         self._plugin_tool_names: Set[str] = set()
         self._plugin_platform_names: Set[str] = set()
         self._cli_commands: Dict[str, dict] = {}
@@ -3715,6 +3757,8 @@ class PluginManager:
             self._plugins.clear()
             self._hooks.clear()
             self._middleware.clear()
+            self._provider_request_guard = None
+            self._provider_request_guard_owner = None
             self._plugin_tool_names.clear()
             self._plugin_platform_names.clear()
             self._cli_commands.clear()
@@ -3883,6 +3927,13 @@ class PluginManager:
         logger.debug("  entrypoints: %d manifest(s)", len(ep_manifests))
         manifests.extend(ep_manifests)
 
+        if self._provider_request_guard_required:
+            self._validate_required_provider_guard_manifests(manifests)
+            # A required HCP worker imports only the exact package-owned guard.
+            # Arbitrary in-process plugins could otherwise inspect or replace
+            # its registration capability and authority-bearing file handles.
+            manifests = [self._required_provider_guard_manifest()]
+
         # Load each manifest (skip user-disabled plugins).
         # Later sources override earlier ones on key collision — user
         # plugins take precedence over bundled, project plugins take
@@ -3901,6 +3952,25 @@ class PluginManager:
         to_load: Dict[str, PluginManifest] = {}
         for manifest in winners.values():
             lookup_key = manifest.key or manifest.name
+
+            if (
+                self._provider_request_guard_required
+                and lookup_key == _HCP_PROVIDER_GUARD_PLUGIN
+            ):
+                self._load_plugin(manifest)
+                if (
+                    self._provider_request_guard is None
+                    or self._provider_request_guard_owner
+                    != _HCP_PROVIDER_GUARD_PLUGIN
+                ):
+                    from hermes_cli.provider_request_guard import (
+                        ProviderRequestGuardRegistrationError,
+                    )
+
+                    raise ProviderRequestGuardRegistrationError(
+                        "the exact bundled HCP provider guard did not register"
+                    )
+                continue
 
             # Explicit disable always wins (matches on key or on legacy
             # bare name for back-compat with existing user configs).
@@ -4044,6 +4114,71 @@ class PluginManager:
         if registered.profile_home != str(get_hermes_home().resolve()):
             return None
         return registered
+
+    def _required_provider_guard_manifest(self) -> PluginManifest:
+        plugin_dir = _required_hcp_plugin_dir()
+        manifest = self._parse_manifest(
+            plugin_dir / "plugin.yaml", plugin_dir, "bundled", ""
+        )
+        if manifest is None or not self._is_exact_required_provider_guard(manifest):
+            from hermes_cli.provider_request_guard import (
+                ProviderRequestGuardRegistrationError,
+            )
+
+            raise ProviderRequestGuardRegistrationError(
+                "the exact bundled HCP provider guard is unavailable"
+            )
+        return manifest
+
+    def _is_exact_required_provider_guard(self, manifest: PluginManifest) -> bool:
+        if (
+            manifest.source != "bundled"
+            or manifest.name != _HCP_PROVIDER_GUARD_PLUGIN
+            or (manifest.key or manifest.name) != _HCP_PROVIDER_GUARD_PLUGIN
+            or manifest.kind != "backend"
+            or manifest.path is None
+        ):
+            return False
+        try:
+            plugin_dir = Path(manifest.path)
+            if plugin_dir.resolve() != _required_hcp_plugin_dir().resolve():
+                return False
+            for name, expected_sha256 in _HCP_PROVIDER_GUARD_FILES.items():
+                path = plugin_dir / name
+                info = os.lstat(path)
+                if (
+                    path.is_symlink()
+                    or not stat.S_ISREG(info.st_mode)
+                    or info.st_uid != os.geteuid()
+                    or stat.S_IMODE(info.st_mode) & 0o022
+                    or hashlib.sha256(path.read_bytes()).hexdigest()
+                    != expected_sha256
+                ):
+                    return False
+        except OSError:
+            return False
+        return bool(_HCP_PROVIDER_GUARD_FILES)
+
+    def _validate_required_provider_guard_manifests(
+        self, manifests: List[PluginManifest]
+    ) -> None:
+        """Reject a same-name substitute before importing plugin code."""
+
+        if not self._provider_request_guard_required:
+            return
+        from hermes_cli.provider_request_guard import (
+            ProviderRequestGuardRegistrationError,
+        )
+
+        for manifest in manifests:
+            lookup_key = manifest.key or manifest.name
+            if (
+                lookup_key == _HCP_PROVIDER_GUARD_PLUGIN
+                or manifest.name == _HCP_PROVIDER_GUARD_PLUGIN
+            ) and not self._is_exact_required_provider_guard(manifest):
+                raise ProviderRequestGuardRegistrationError(
+                    "the HCP provider guard is a reserved plugin identity"
+                )
 
     def _collect_directory_manifests(self) -> List[PluginManifest]:
         """Collect directory manifests in the same order as full discovery.
@@ -4791,7 +4926,17 @@ class PluginManager:
                 loaded.error = "no register() function"
                 logger.warning("Plugin '%s' has no register() function", manifest.name)
             else:
-                ctx = PluginContext(manifest, self)
+                capability = None
+                if (
+                    self._provider_request_guard_required
+                    and self._is_exact_required_provider_guard(manifest)
+                ):
+                    capability = self.__provider_guard_registration_capability
+                ctx = PluginContext(
+                    manifest,
+                    self,
+                    provider_guard_registration_capability=capability,
+                )
                 register_fn(ctx)
                 registrations = [
                     registration
@@ -5408,6 +5553,105 @@ class PluginManager:
             )
         return rendered
 
+    def register_provider_request_guard(
+        self,
+        callback: Callable,
+        *,
+        owner: str,
+        capability: object | None = None,
+    ) -> None:
+        """Install exactly one fail-closed provider guard for this process."""
+
+        from hermes_cli.provider_request_guard import (
+            ProviderRequestGuardRegistrationError,
+        )
+
+        if not callable(callback) or not isinstance(owner, str) or not owner:
+            raise ProviderRequestGuardRegistrationError(
+                "provider request guard registration is invalid"
+            )
+        if self._provider_request_guard_required and owner != _HCP_PROVIDER_GUARD_PLUGIN:
+            raise ProviderRequestGuardRegistrationError(
+                "the required provider request guard has the wrong owner"
+            )
+        if (
+            self._provider_request_guard_required
+            and capability is not self.__provider_guard_registration_capability
+        ):
+            raise ProviderRequestGuardRegistrationError(
+                "the required provider request guard lacks its registration capability"
+            )
+        if self._provider_request_guard is not None:
+            raise ProviderRequestGuardRegistrationError(
+                "a provider request guard is already registered by "
+                f"{self._provider_request_guard_owner}"
+            )
+        self._provider_request_guard = callback
+        self._provider_request_guard_owner = owner
+
+    def enforce_provider_request_guard(
+        self,
+        *,
+        request: Mapping[str, Any],
+        **context: Any,
+    ):
+        """Authorize one immutable request or stop before provider transport."""
+
+        from hermes_cli.provider_request_guard import (
+            ProviderRequestBlocked,
+            canonical_request_sha256,
+            validate_authorization,
+        )
+
+        guard = self._provider_request_guard
+        if guard is None:
+            if self._provider_request_guard_required:
+                raise ProviderRequestBlocked("PROVIDER_REQUEST_GUARD_UNAVAILABLE")
+            return None
+        request_copy = dict(request)
+        request_sha256 = canonical_request_sha256(request_copy)
+        try:
+            result = guard(
+                request=request_copy,
+                request_sha256=request_sha256,
+                **context,
+            )
+        except ProviderRequestBlocked:
+            raise
+        except Exception as exc:
+            raise ProviderRequestBlocked("PROVIDER_REQUEST_GUARD_FAILED") from exc
+        if canonical_request_sha256(request) != request_sha256:
+            raise ProviderRequestBlocked("PROVIDER_REQUEST_CHANGED")
+        return validate_authorization(
+            result,
+            expected_request_sha256=request_sha256,
+        )
+
+    def bind_provider_response_guard(self, **binding: Any) -> Mapping[str, Any]:
+        """Durably bind one normalized provider response through HCP."""
+
+        from hermes_cli.provider_request_guard import ProviderRequestBlocked
+
+        guard = self._provider_request_guard
+        callback = getattr(guard, "bind_provider_response", None)
+        if not callable(callback):
+            raise ProviderRequestBlocked("PROVIDER_RESPONSE_GUARD_UNAVAILABLE")
+        try:
+            result = callback(**binding)
+        except ProviderRequestBlocked:
+            raise
+        except Exception as exc:
+            raise ProviderRequestBlocked("PROVIDER_RESPONSE_GUARD_FAILED") from exc
+        if not isinstance(result, Mapping):
+            raise ProviderRequestBlocked("PROVIDER_RESPONSE_BINDING_INVALID")
+        return dict(result)
+
+    def provider_request_guard_required(self) -> bool:
+        return self._provider_request_guard_required
+
+    def provider_request_guard_active(self) -> bool:
+        return self._provider_request_guard_required or self._provider_request_guard is not None
+
     def has_middleware(self, kind: str) -> bool:
         """Return True when at least one callback is registered for middleware."""
         return bool(self._middleware.get(kind))
@@ -5867,6 +6111,29 @@ def invoke_middleware(kind: str, **kwargs: Any) -> List[Any]:
     Returns a list of non-``None`` return values from middleware callbacks.
     """
     return _delivery_manager().invoke_middleware(kind, **kwargs)
+
+
+def enforce_provider_request_guard(*, request: Mapping[str, Any], **context: Any):
+    """Authorize one provider request through the configured fail-closed guard."""
+
+    return _delivery_manager().enforce_provider_request_guard(
+        request=request,
+        **context,
+    )
+
+
+def bind_provider_response_guard(**binding: Any) -> Mapping[str, Any]:
+    """Persist one exact provider-response/tool-call binding through HCP."""
+
+    return _delivery_manager().bind_provider_response_guard(**binding)
+
+
+def provider_request_guard_required() -> bool:
+    return get_plugin_manager().provider_request_guard_required()
+
+
+def provider_request_guard_active() -> bool:
+    return get_plugin_manager().provider_request_guard_active()
 
 
 def has_middleware(kind: str) -> bool:

@@ -73,3 +73,29 @@ class TestSessionIdForwarding:
                 skip_pre_tool_call_hook=True,
             )
         assert captured.get("task_id") == "task-999"
+
+    def test_exact_model_attempt_identity_is_forwarded(self):
+        """Registry tools receive the exact turn and provider-attempt identity."""
+        captured = {}
+        with patch("model_tools.registry", _make_registry(captured)):
+            from model_tools import handle_function_call
+
+            handle_function_call(
+                "web_search",
+                {"query": "test"},
+                task_id="task-999",
+                session_id="sess-1",
+                turn_id="turn-7",
+                api_request_id="turn-7:api:2",
+                tool_call_id="call-3",
+                skip_pre_tool_call_hook=True,
+            )
+
+        assert captured == {
+            "api_request_id": "turn-7:api:2",
+            "session_id": "sess-1",
+            "task_id": "task-999",
+            "tool_call_id": "call-3",
+            "turn_id": "turn-7",
+            "user_task": None,
+        }

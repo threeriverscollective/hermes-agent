@@ -1702,6 +1702,29 @@ def run_conversation(
     except Exception:
         logger.debug("per-turn env credential refresh failed", exc_info=True)
 
+    # HCP-managed workers use one narrowly supported, post-construction
+    # provider route. Features that could perform or rewrite an auxiliary
+    # model request before that boundary are a typed stop, never a fallback.
+    from hermes_cli.plugins import (
+        get_plugin_manager as _get_plugin_manager,
+        provider_request_guard_required as _provider_guard_required,
+    )
+    from hermes_cli.provider_request_guard import ProviderRequestBlocked
+
+    if _provider_guard_required():
+        _manager = _get_plugin_manager()
+        if (
+            agent.compression_enabled
+            or agent.api_mode != "chat_completions"
+            or agent.provider == "moa"
+            or env_var_enabled("HERMES_KANBAN_GOAL_MODE")
+            or _manager.has_hook("pre_llm_call")
+            or _manager.has_hook("pre_api_request")
+            or _manager.has_middleware("llm_request")
+            or _manager.has_middleware("llm_execution")
+        ):
+            raise ProviderRequestBlocked("PROVIDER_REQUEST_GUARD_ROUTE_UNSUPPORTED")
+
     # ── Per-turn setup (the prologue) ──
     # All once-per-turn setup — stdio guarding, retry-counter resets, user
     # message sanitization, todo/nudge hydration, system-prompt restore-or-
@@ -2903,7 +2926,15 @@ def run_conversation(
                     if isinstance(getattr(agent, "client", None), Mock):
                         _use_streaming = False
 
+                from hermes_cli.plugins import provider_request_guard_active
+
+                if provider_request_guard_active():
+                    _use_streaming = False
+
+                _provider_response_observed_at_unix_ms = None
+
                 def _perform_api_call(next_api_kwargs):
+                    nonlocal _provider_response_observed_at_unix_ms
                     if agent.api_mode == "codex_responses":
                         next_api_kwargs = agent._get_transport().preflight_kwargs(
                             next_api_kwargs,
@@ -2911,13 +2942,37 @@ def run_conversation(
                             is_github_responses=agent._is_copilot_url(),
                             sanitize_harmony_tokens=agent._is_codex_backend(),
                         )
+                    if provider_request_guard_active():
+                        _managed_task_id = (
+                            os.environ.get("HERMES_KANBAN_TASK", "").strip()
+                            or effective_task_id
+                        )
+                        _profile_id = os.environ.get("HERMES_PROFILE", "").strip()
+                        if not _profile_id:
+                            try:
+                                from hermes_cli.profiles import get_active_profile_name
+
+                                _profile_id = get_active_profile_name()
+                            except Exception:
+                                _profile_id = "default"
+                        agent._provider_request_guard_context = {
+                            "task_id": _managed_task_id,
+                            "turn_id": turn_id,
+                            "api_request_id": api_request_id,
+                            "session_id": agent.session_id or "",
+                            "profile_id": _profile_id,
+                            "provider": agent.provider,
+                            "model": agent.model,
+                            "api_mode": agent.api_mode,
+                            "api_call_count": api_call_count,
+                        }
                     if _use_streaming:
                         return agent._interruptible_streaming_api_call(
                             next_api_kwargs, on_first_delta=_stop_spinner
                         )
                     from agent import relay_llm
 
-                    return relay_llm.execute(
+                    result = relay_llm.execute(
                         next_api_kwargs,
                         agent._interruptible_api_call,
                         session_id=str(agent.session_id or ""),
@@ -2937,6 +2992,13 @@ def run_conversation(
                         },
                         defer_logical_completion=True,
                     )
+                    if provider_request_guard_active():
+                        # Capture completion at the provider boundary, before
+                        # response normalization or any tool processing.
+                        _provider_response_observed_at_unix_ms = (
+                            time.time_ns() // 1_000_000
+                        )
+                    return result
 
                 from hermes_cli.middleware import run_llm_execution_middleware
 
@@ -7067,7 +7129,55 @@ def run_conversation(
                     except Exception:
                         pass
 
-                agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+                _guard_context = getattr(
+                    agent, "_provider_request_guard_context", None
+                )
+                if provider_request_guard_active():
+                    if not isinstance(_guard_context, dict):
+                        raise ProviderRequestBlocked(
+                            "PROVIDER_REQUEST_CONTEXT_UNAVAILABLE"
+                        )
+                    from hermes_cli.provider_request_guard import (
+                        bind_provider_response_tool_calls,
+                        discard_provider_request_authorization,
+                    )
+
+                    bind_provider_response_tool_calls(
+                        task_id=_guard_context.get("task_id"),
+                        session_id=_guard_context.get("session_id"),
+                        turn_id=_guard_context.get("turn_id"),
+                        api_request_id=_guard_context.get("api_request_id"),
+                        tool_calls=[
+                            (
+                                tc.id,
+                                tc.function.name,
+                                tc.function.arguments,
+                            )
+                            for tc in assistant_message.tool_calls
+                        ],
+                        finish_reason=str(finish_reason or ""),
+                        assistant_content=str(assistant_message.content or ""),
+                        response_observed_at_unix_ms=(
+                            _provider_response_observed_at_unix_ms
+                        ),
+                    )
+                try:
+                    agent._execute_tool_calls(
+                        assistant_message,
+                        messages,
+                        effective_task_id,
+                        api_call_count,
+                    )
+                finally:
+                    if provider_request_guard_active() and isinstance(
+                        _guard_context, dict
+                    ):
+                        discard_provider_request_authorization(
+                            task_id=_guard_context.get("task_id"),
+                            session_id=_guard_context.get("session_id"),
+                            turn_id=_guard_context.get("turn_id"),
+                            api_request_id=_guard_context.get("api_request_id"),
+                        )
 
                 if getattr(agent, "_incremental_persistence_failed", False):
                     # A tool result could not be made canonical. Do not send
@@ -7288,6 +7398,21 @@ def run_conversation(
             
             else:
                 # No tool calls - this is the final response.
+                if provider_request_guard_active():
+                    from hermes_cli.provider_request_guard import (
+                        discard_provider_request_authorization,
+                    )
+
+                    _guard_context = getattr(
+                        agent, "_provider_request_guard_context", None
+                    )
+                    if isinstance(_guard_context, dict):
+                        discard_provider_request_authorization(
+                            task_id=_guard_context.get("task_id"),
+                            session_id=_guard_context.get("session_id"),
+                            turn_id=_guard_context.get("turn_id"),
+                            api_request_id=_guard_context.get("api_request_id"),
+                        )
                 # (Dropped tool-call recovery — finish_reason=="tool_calls" with
                 # an empty tool_calls array — is handled at the finalization
                 # chokepoint below, after final_msg is built, so it catches

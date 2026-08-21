@@ -1,8 +1,9 @@
 """Pinned host-side bridge for HCP repository-scoped diagnostic reads.
 
 This tool is intentionally unavailable unless an HCP-launched Hermes process
-receives one owner-only, exact runtime binding.  The model supplies only the
-opaque request id, digest, and nonce.  Repository/card/run identities and both
+receives one owner-only, exact runtime binding.  The model supplies only one
+stable opaque offer id. HCP materializes the fresh current-permit-bound request
+and nonce at host-side invocation. Repository/card/run identities and both
 transport keys come from that binding, and the Docker terminal never receives
 the socket or key paths.
 """
@@ -29,18 +30,15 @@ from tools.registry import registry, tool_error
 
 
 TOOL_NAME = "hcp_diagnostics_read"
-WIRE_SCHEMA_VERSION = "hermes.hcp.diagnostics-read-wire.v1"
-RESULT_SCHEMA_VERSION = "hermes.hcp.diagnostics-read-result.v1"
+WIRE_SCHEMA_VERSION = "hermes.hcp.diagnostics-read-wire.v2"
+RESULT_SCHEMA_VERSION = "hermes.hcp.diagnostics-read-result.v2"
 CONFIG_SCHEMA_VERSION = "hermes.hcp.diagnostics-tool-config.v1"
 _CONFIG_ENV = "HCP_DIAGNOSTICS_TOOL_CONFIG"
 _MAX_REQUEST_BYTES = 64 * 1024
 _MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 _TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+\-]{0,255}\Z")
-_REQUEST_DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 _SHA256 = re.compile(r"sha256:[0-9a-f]{64}\Z")
-_INPUT_KEYS = frozenset(
-    {"diagnostics_request_id", "diagnostics_request_digest", "nonce"}
-)
+_INPUT_KEYS = frozenset({"offer_id"})
 _CONFIG_KEYS = frozenset(
     {
         "schema_version",
@@ -64,9 +62,19 @@ _RESPONSE_KEYS = frozenset(
         "repository_id",
         "card_id",
         "run_id",
-        "diagnostics_request_id",
-        "diagnostics_request_digest",
-        "nonce",
+        "offer_id",
+        "task_id",
+        "session_id",
+        "turn_id",
+        "api_request_id",
+        "tool_call_id",
+        "provider_authorization_id",
+        "provider_request_sha256",
+        "provider_subject_sha256",
+        "provider_response_observed_at_unix_ms",
+        "provider_response_sha256",
+        "provider_response_binding_sha256",
+        "provider_response_binding_receipt_id",
         "records",
         "receipt",
         "replayed",
@@ -139,12 +147,6 @@ def _strict_json(raw: bytes, *, limit: int) -> dict[str, object]:
 
 def _token(value: object) -> str:
     if type(value) is not str or _TOKEN.fullmatch(value) is None:
-        raise HcpDiagnosticsToolRefusal("BROKER_TRANSPORT_AUTH_INVALID")
-    return value
-
-
-def _request_digest(value: object) -> str:
-    if type(value) is not str or _REQUEST_DIGEST.fullmatch(value) is None:
         raise HcpDiagnosticsToolRefusal("BROKER_TRANSPORT_AUTH_INVALID")
     return value
 
@@ -264,7 +266,15 @@ def _write_frame(channel: socket.socket, value: Mapping[str, object]) -> None:
     channel.sendall(struct.pack(">I", len(payload)) + payload)
 
 
-def _execute(value: Mapping[str, object]) -> dict[str, object]:
+def _execute(
+    value: Mapping[str, object],
+    *,
+    task_id: object,
+    session_id: object,
+    turn_id: object,
+    api_request_id: object,
+    tool_call_id: object,
+) -> dict[str, object]:
     if type(value) is not dict or set(value) != _INPUT_KEYS:
         raise HcpDiagnosticsToolRefusal("BROKER_SCOPE_MISMATCH")
     binding = _load_binding()
@@ -277,17 +287,76 @@ def _execute(value: Mapping[str, object]) -> dict[str, object]:
     public_key = Ed25519PublicKey.from_public_bytes(
         _read_private_file(verification["key_path"], verification["key_sha256"])
     )
+    invocation = {
+        "task_id": _token(task_id),
+        "session_id": _token(session_id),
+        "turn_id": _token(turn_id),
+        "api_request_id": _token(api_request_id),
+        "tool_call_id": _token(tool_call_id),
+    }
+    if invocation["task_id"] != binding["card_id"]:
+        raise HcpDiagnosticsToolRefusal("BROKER_SCOPE_MISMATCH")
+    from hermes_cli.provider_request_guard import (
+        ProviderRequestBlocked,
+        consume_provider_tool_invocation,
+    )
+
+    try:
+        attestation = consume_provider_tool_invocation(
+            **invocation,
+            tool_name=TOOL_NAME,
+        )
+    except ProviderRequestBlocked as error:
+        raise HcpDiagnosticsToolRefusal(
+            "BROKER_TRANSPORT_AUTH_INVALID"
+        ) from error
+    provider_attestation = {
+        "provider_authorization_id": _token(attestation.authorization_id),
+        "provider_request_sha256": attestation.request_sha256,
+        "provider_subject_sha256": attestation.subject_sha256,
+        "provider_response_observed_at_unix_ms": (
+            attestation.response_observed_at_unix_ms
+        ),
+        "provider_response_sha256": attestation.response_sha256,
+        "provider_response_binding_sha256": (
+            attestation.response_binding_sha256
+        ),
+        "provider_response_binding_receipt_id": attestation.binding_receipt_id,
+    }
+    if (
+        _SHA256.fullmatch(provider_attestation["provider_request_sha256"])
+        is None
+        or _SHA256.fullmatch(provider_attestation["provider_subject_sha256"])
+        is None
+        or _SHA256.fullmatch(
+            provider_attestation["provider_response_sha256"]
+        )
+        is None
+        or _SHA256.fullmatch(
+            provider_attestation["provider_response_binding_sha256"]
+        )
+        is None
+        or type(
+            provider_attestation["provider_response_binding_receipt_id"]
+        )
+        is not str
+        or not provider_attestation["provider_response_binding_receipt_id"]
+        or type(
+            provider_attestation["provider_response_observed_at_unix_ms"]
+        )
+        is not int
+        or provider_attestation["provider_response_observed_at_unix_ms"] <= 0
+    ):
+        raise HcpDiagnosticsToolRefusal("BROKER_TRANSPORT_AUTH_INVALID")
     unsigned = {
         "schema_version": WIRE_SCHEMA_VERSION,
         "operation": TOOL_NAME,
         "repository_id": binding["repository_id"],
         "card_id": binding["card_id"],
         "run_id": binding["run_id"],
-        "diagnostics_request_id": _token(value["diagnostics_request_id"]),
-        "diagnostics_request_digest": _request_digest(
-            value["diagnostics_request_digest"]
-        ),
-        "nonce": _token(value["nonce"]),
+        "offer_id": _token(value["offer_id"]),
+        **invocation,
+        **provider_attestation,
         "signing_identity": signing["signing_identity"],
         "key_id": signing["key_id"],
     }
@@ -318,9 +387,9 @@ def _execute(value: Mapping[str, object]) -> dict[str, object]:
         "repository_id": binding["repository_id"],
         "card_id": binding["card_id"],
         "run_id": binding["run_id"],
-        "diagnostics_request_id": value["diagnostics_request_id"],
-        "diagnostics_request_digest": value["diagnostics_request_digest"],
-        "nonce": value["nonce"],
+        "offer_id": value["offer_id"],
+        **invocation,
+        **provider_attestation,
         "signing_identity": verification["signing_identity"],
         "key_id": verification["key_id"],
     }
@@ -346,9 +415,24 @@ def _execute(value: Mapping[str, object]) -> dict[str, object]:
     }
 
 
-def hcp_diagnostics_read_tool(args: object) -> str:
+def hcp_diagnostics_read_tool(
+    args: object,
+    *,
+    task_id: object = "",
+    session_id: object = "",
+    turn_id: object = "",
+    api_request_id: object = "",
+    tool_call_id: object = "",
+) -> str:
     try:
-        result = _execute(args)  # type: ignore[arg-type]
+        result = _execute(
+            args,  # type: ignore[arg-type]
+            task_id=task_id,
+            session_id=session_id,
+            turn_id=turn_id,
+            api_request_id=api_request_id,
+            tool_call_id=tool_call_id,
+        )
     except HcpDiagnosticsToolRefusal as error:
         return tool_error(error.code, error_code=error.code)
     return json.dumps(result, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -357,24 +441,15 @@ def hcp_diagnostics_read_tool(args: object) -> str:
 HCP_DIAGNOSTICS_READ_SCHEMA = {
     "name": TOOL_NAME,
     "description": (
-        "Read one HCP-admitted, repository-scoped diagnostic request. The request "
-        "identity and nonce must exactly match an offer in the current task."
+        "Read one HCP-admitted, repository-scoped diagnostic offer. The stable "
+        "opaque offer id must exactly match the current task context."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "diagnostics_request_id": {"type": "string"},
-            "diagnostics_request_digest": {
-                "type": "string",
-                "pattern": "^[0-9a-f]{64}$",
-            },
-            "nonce": {"type": "string"},
+            "offer_id": {"type": "string"},
         },
-        "required": [
-            "diagnostics_request_id",
-            "diagnostics_request_digest",
-            "nonce",
-        ],
+        "required": ["offer_id"],
         "additionalProperties": False,
     },
 }
@@ -384,7 +459,14 @@ registry.register(
     name=TOOL_NAME,
     toolset="hcp_diagnostics",
     schema=HCP_DIAGNOSTICS_READ_SCHEMA,
-    handler=lambda args, **_: hcp_diagnostics_read_tool(args),
+    handler=lambda args, **identity: hcp_diagnostics_read_tool(
+        args,
+        task_id=identity.get("task_id", ""),
+        session_id=identity.get("session_id", ""),
+        turn_id=identity.get("turn_id", ""),
+        api_request_id=identity.get("api_request_id", ""),
+        tool_call_id=identity.get("tool_call_id", ""),
+    ),
     check_fn=hcp_diagnostics_available,
     emoji="🔎",
     max_result_size_chars=2 * 1024 * 1024,

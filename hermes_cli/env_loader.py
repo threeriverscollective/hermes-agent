@@ -51,6 +51,37 @@ _SECRET_SOURCE_VALUES_BY_HOME: dict[str, dict[str, str]] = {}
 _APPLIED_HOMES: set[str] = set()
 _SECRET_SOURCE_CACHE_LOCK = threading.RLock()
 
+# Dispatcher-selected worker identity and permit handles are authority, not
+# profile configuration. A profile dotenv must never clear or replace them.
+_INHERITED_WORKER_IDENTITY_KEYS = frozenset(
+    {
+        "HCP_PRE_MODEL_PERMIT_REQUIRED",
+        "HCP_PRE_MODEL_PERMIT_ROOT_FD",
+        "HCP_PRE_MODEL_PERMIT_SOCKET",
+        "HCP_PRE_MODEL_PERMIT_MANIFEST_FD",
+        "HCP_PRE_MODEL_PERMIT_PEER_PRIVATE_KEY_FD",
+        "HCP_PRE_MODEL_PERMIT_SERVER_PUBLIC_KEY_FD",
+        "HERMES_KANBAN_TASK",
+        "HERMES_KANBAN_RUN_ID",
+        "HERMES_KANBAN_CLAIM_LOCK",
+        "HERMES_KANBAN_BOARD",
+        "HERMES_KANBAN_DB",
+        "HERMES_PROFILE",
+    }
+)
+
+
+def _inherited_worker_identity() -> dict[str, str | None]:
+    return {key: os.environ.get(key) for key in _INHERITED_WORKER_IDENTITY_KEYS}
+
+
+def _restore_inherited_worker_identity(identity: dict[str, str | None]) -> None:
+    for key, value in identity.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+
 
 def _known_hermes_env_keys() -> set[str]:
     """Return the combined set of known Hermes env-var keys.
@@ -340,18 +371,18 @@ def _sanitize_loaded_credentials() -> None:
 
 
 def _load_dotenv_with_fallback(path: Path, *, override: bool) -> None:
+    inherited_identity = _inherited_worker_identity()
     try:
-        # utf-8-sig strips a leading UTF-8 BOM if present (PowerShell 5.1
-        # Set-Content -Encoding UTF8 / Notepad) and is a no-op for BOM-less
-        # UTF-8. Plain "utf-8" would keep U+FEFF on the first key name and
-        # silently drop it from os.environ under its canonical name.
-        load_dotenv(dotenv_path=path, override=override, encoding="utf-8-sig")
-    except UnicodeDecodeError:
-        # utf-8-sig can't strip a BOM once we fall back to latin-1 decode.
-        raw = path.read_bytes()
-        if raw.startswith(codecs.BOM_UTF8):
-            raw = raw[len(codecs.BOM_UTF8) :]
-        load_dotenv(stream=io.StringIO(raw.decode("latin-1")), override=override)
+        try:
+            # utf-8-sig strips a leading UTF-8 BOM if present.
+            load_dotenv(dotenv_path=path, override=override, encoding="utf-8-sig")
+        except UnicodeDecodeError:
+            raw = path.read_bytes()
+            if raw.startswith(codecs.BOM_UTF8):
+                raw = raw[len(codecs.BOM_UTF8) :]
+            load_dotenv(stream=io.StringIO(raw.decode("latin-1")), override=override)
+    finally:
+        _restore_inherited_worker_identity(inherited_identity)
     # Strip non-ASCII characters from credential env vars that were just
     # loaded.  API keys must be pure ASCII since they're sent as HTTP
     # header values (httpx encodes headers as ASCII).  Non-ASCII chars
@@ -485,6 +516,7 @@ def load_hermes_dotenv(
       dependencies into the process that replaces that same environment.
     """
     loaded: list[Path] = []
+    inherited_identity = _inherited_worker_identity()
 
     home_path = Path(hermes_home or os.getenv("HERMES_HOME", Path.home() / ".hermes"))
     user_env = home_path / ".env"
@@ -536,7 +568,9 @@ def load_hermes_dotenv(
 
     if load_external_secrets and not _early_recovery._should_skip_external_secret_sources():
         _apply_external_secret_sources(home_path)
+    _restore_inherited_worker_identity(inherited_identity)
     _apply_managed_env()
+    _restore_inherited_worker_identity(inherited_identity)
 
     # config.yaml is the documented source of truth for terminal.* settings,
     # but the dotenv loads above run with override=True — so a stale
