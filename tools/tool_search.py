@@ -58,6 +58,11 @@ TOOL_CALL_NAME = "tool_call"
 
 BRIDGE_TOOL_NAMES = frozenset({TOOL_SEARCH_NAME, TOOL_DESCRIBE_NAME, TOOL_CALL_NAME})
 
+# This independently pinned host-side capability must remain a direct model
+# tool so its exact provider-response tool-call identity can be authenticated
+# by HCP.  It is intentionally not part of Hermes's generic core tool set.
+_DIRECT_HOST_TOOLS = frozenset({"hcp_diagnostics_read"})
+
 # When estimating tokens from char count without a real tokenizer, this is
 # the cheap rule of thumb that's stable across providers. Roughly 4 chars
 # per token for English+JSON. Underestimating leads to false negatives
@@ -210,6 +215,8 @@ def is_deferrable_tool_name(name: str) -> bool:
     against accidental shadowing).
     """
     if name in BRIDGE_TOOL_NAMES:
+        return False
+    if name in _DIRECT_HOST_TOOLS:
         return False
     if name in _core_tool_names():
         return False

@@ -85,6 +85,13 @@ class TestClassification:
         for name in BRIDGE_TOOL_NAMES:
             assert not is_deferrable_tool_name(name)
 
+    def test_hcp_diagnostics_tool_never_defers(self):
+        from toolsets import _HERMES_CORE_TOOLS
+        from tools.tool_search import is_deferrable_tool_name
+
+        assert "hcp_diagnostics_read" not in _HERMES_CORE_TOOLS
+        assert not is_deferrable_tool_name("hcp_diagnostics_read")
+
     def test_unknown_tool_not_deferrable(self):
         """Defensive: a tool name we cannot resolve to a registry entry must
         not be claimed as deferrable. This protects against the OpenClaw
