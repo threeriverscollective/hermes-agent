@@ -76,7 +76,7 @@ from hermes_cli.plugin_capabilities import (
 
 _HCP_PROVIDER_GUARD_PLUGIN = "hcp_post_claim_pre_model_permit"
 _HCP_PROVIDER_GUARD_FILES: dict[str, str] = {
-    "__init__.py": "043992ed5e6123a51e05b10d64eb62602a0a7b52174d261a27305b174715fdc2",
+    "__init__.py": "f787756ec6918300d16b6de400d6d1db53a3441ee01738937b90c44c82720e5e",
     "channel.py": "ae561a78003b74c803c4907ec896877e6e7956d5d71d91613b0bf90dbdbc78f1",
     "plugin.yaml": "b5a44bb3cdef47559b7b533dd8bf1671861e572b52bb2003eba539fae6282d5c",
 }
