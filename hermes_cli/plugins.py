@@ -76,7 +76,7 @@ from hermes_cli.plugin_capabilities import (
 
 _HCP_PROVIDER_GUARD_PLUGIN = "hcp_post_claim_pre_model_permit"
 _HCP_PROVIDER_GUARD_FILES: dict[str, str] = {
-    "__init__.py": "f787756ec6918300d16b6de400d6d1db53a3441ee01738937b90c44c82720e5e",
+    "__init__.py": "be0ef13cb1fe5e9d7c88ab8da6647bc649d6e20bf1577c8677dbce4c88ebdd5f",
     "channel.py": "ae561a78003b74c803c4907ec896877e6e7956d5d71d91613b0bf90dbdbc78f1",
     "plugin.yaml": "b5a44bb3cdef47559b7b533dd8bf1671861e572b52bb2003eba539fae6282d5c",
 }
@@ -5652,6 +5652,31 @@ class PluginManager:
     def provider_request_guard_active(self) -> bool:
         return self._provider_request_guard_required or self._provider_request_guard is not None
 
+    def provider_request_model_token_limit(self) -> int:
+        """Read the immutable request cap from the registered HCP guard."""
+
+        from hermes_cli.provider_request_guard import ProviderRequestBlocked
+
+        guard = self._provider_request_guard
+        reader = getattr(guard, "model_token_limit", None)
+        if not callable(reader):
+            raise ProviderRequestBlocked(
+                "PROVIDER_REQUEST_MODEL_BUDGET_UNBOUNDED"
+            )
+        try:
+            value = reader()
+        except ProviderRequestBlocked:
+            raise
+        except Exception as exc:
+            raise ProviderRequestBlocked(
+                "PROVIDER_REQUEST_MODEL_BUDGET_UNBOUNDED"
+            ) from exc
+        if type(value) is not int or value <= 0:
+            raise ProviderRequestBlocked(
+                "PROVIDER_REQUEST_MODEL_BUDGET_UNBOUNDED"
+            )
+        return value
+
     def has_middleware(self, kind: str) -> bool:
         """Return True when at least one callback is registered for middleware."""
         return bool(self._middleware.get(kind))
@@ -6134,6 +6159,12 @@ def provider_request_guard_required() -> bool:
 
 def provider_request_guard_active() -> bool:
     return get_plugin_manager().provider_request_guard_active()
+
+
+def provider_request_model_token_limit() -> int:
+    """Return the exact model-token cap bound by the active HCP guard."""
+
+    return _delivery_manager().provider_request_model_token_limit()
 
 
 def has_middleware(kind: str) -> bool:

@@ -318,6 +318,83 @@ def test_guarded_xai_codex_response_is_permitted_immediately_before_provider(
     assert events == ["permit", "provider"]
 
 
+def test_guarded_xai_request_uses_exact_manifest_token_limit_when_absent(
+    monkeypatch,
+) -> None:
+    from agent.chat_completion_helpers import _dispatch_nonstreaming_api_request
+    from hermes_cli import plugins
+    from hermes_cli.provider_request_guard import ProviderRequestAuthorization
+
+    events: list[str] = []
+    manager = plugins.PluginManager()
+    manager._provider_request_guard_required = True
+
+    def allow(**kwargs):
+        events.append("permit")
+        assert kwargs["model_tokens_requested"] == 73
+        assert kwargs["request"]["max_output_tokens"] == 73
+        return ProviderRequestAuthorization(
+            authorization_id="test-only-manifest-budget-authorization",
+            request_sha256=kwargs["request_sha256"],
+            subject_sha256="sha256:" + "7" * 64,
+            expires_at_monotonic=time.monotonic() + 30,
+        )
+
+    allow.model_token_limit = lambda: 73
+    manager._provider_request_guard = allow
+    monkeypatch.setattr(plugins, "_plugin_manager", manager)
+
+    class Responses:
+        @staticmethod
+        def create(**kwargs):
+            events.append("provider")
+            assert kwargs["max_output_tokens"] == 73
+            return SimpleNamespace(id="response-manifest-budget", output=[])
+
+    client = SimpleNamespace(
+        base_url="https://api.x.ai/v1/",
+        max_retries=0,
+        default_headers={
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Authorization": "Bearer test-only-key",
+        },
+        default_query={},
+        responses=Responses(),
+    )
+    target = SimpleNamespace(
+        api_mode="codex_responses",
+        provider="xai-oauth",
+        model="grok-4.6",
+        api_key="test-only-key",
+        base_url="https://api.x.ai/v1",
+        _provider_request_guard_context={
+            "task_id": "card-7",
+            "turn_id": "turn-1",
+            "api_request_id": "turn-1:api:1",
+            "session_id": "session-9",
+            "profile_id": "implementer",
+            "provider": "xai-oauth",
+            "model": "grok-4.6",
+            "api_mode": "codex_responses",
+            "api_call_count": 1,
+        },
+    )
+
+    result = _dispatch_nonstreaming_api_request(
+        target,
+        {
+            "model": "grok-4.6",
+            "input": "bounded",
+            "extra_headers": {"x-grok-conv-id": "session-9"},
+        },
+        make_client=lambda _reason: client,
+    )
+
+    assert result.id == "response-manifest-budget"
+    assert events == ["permit", "provider"]
+
+
 @pytest.mark.parametrize(
     "extra_headers",
     [

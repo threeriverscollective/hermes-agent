@@ -927,7 +927,10 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
     if agent.api_mode == "codex_responses":
         request_client = make_client("codex_stream_request")
         if guard_active:
-            from hermes_cli.plugins import enforce_provider_request_guard
+            from hermes_cli.plugins import (
+                enforce_provider_request_guard,
+                provider_request_model_token_limit,
+            )
             from hermes_cli.provider_request_guard import (
                 ProviderRequestBlocked,
                 begin_provider_request_authorization,
@@ -963,11 +966,6 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
                     "PROVIDER_REQUEST_ROUTE_UNSUPPORTED"
                 )
             sdk_request = canonical_sdk_request(api_kwargs)
-            wire_request = canonical_model_request(sdk_request)
-            if wire_request.get("stream") not in (None, False):
-                raise ProviderRequestBlocked(
-                    "PROVIDER_REQUEST_ROUTE_UNSUPPORTED"
-                )
             endpoint, transport_identity_sha256 = client_transport_identity(
                 request_client,
                 expected_base_url=agent.base_url,
@@ -975,10 +973,16 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
                 request_headers=request_headers,
             )
             token_fields = [
-                wire_request[key]
+                sdk_request[key]
                 for key in ("max_output_tokens",)
-                if key in wire_request
+                if key in sdk_request
             ]
+            if not token_fields:
+                sdk_request = {
+                    **sdk_request,
+                    "max_output_tokens": provider_request_model_token_limit(),
+                }
+                token_fields = [sdk_request["max_output_tokens"]]
             if (
                 len(token_fields) != 1
                 or type(token_fields[0]) is not int
@@ -986,6 +990,11 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
             ):
                 raise ProviderRequestBlocked(
                     "PROVIDER_REQUEST_MODEL_BUDGET_UNBOUNDED"
+                )
+            wire_request = canonical_model_request(sdk_request)
+            if wire_request.get("stream") not in (None, False):
+                raise ProviderRequestBlocked(
+                    "PROVIDER_REQUEST_ROUTE_UNSUPPORTED"
                 )
             authorization = enforce_provider_request_guard(
                 request=wire_request,
@@ -1079,7 +1088,10 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
         return agent.client.chat.completions.create(**api_kwargs)
     request_client = make_client("chat_completion_request")
     if guard_active:
-        from hermes_cli.plugins import enforce_provider_request_guard
+        from hermes_cli.plugins import (
+            enforce_provider_request_guard,
+            provider_request_model_token_limit,
+        )
         from hermes_cli.provider_request_guard import (
             ProviderRequestBlocked,
             begin_provider_request_authorization,
@@ -1101,23 +1113,29 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
         ):
             raise ProviderRequestBlocked("PROVIDER_REQUEST_ROUTE_UNSUPPORTED")
         sdk_request = canonical_sdk_request(api_kwargs)
-        wire_request = canonical_model_request(sdk_request)
         endpoint, transport_identity_sha256 = client_transport_identity(
             request_client,
             expected_base_url=agent.base_url,
             expected_api_key=agent.api_key,
         )
         token_fields = [
-            wire_request[key]
+            sdk_request[key]
             for key in ("max_completion_tokens", "max_tokens")
-            if key in wire_request
+            if key in sdk_request
         ]
+        if not token_fields:
+            sdk_request = {
+                **sdk_request,
+                "max_tokens": provider_request_model_token_limit(),
+            }
+            token_fields = [sdk_request["max_tokens"]]
         if (
             len(token_fields) != 1
             or type(token_fields[0]) is not int
             or token_fields[0] <= 0
         ):
             raise ProviderRequestBlocked("PROVIDER_REQUEST_MODEL_BUDGET_UNBOUNDED")
+        wire_request = canonical_model_request(sdk_request)
         authorization = enforce_provider_request_guard(
             request=wire_request,
             **context,

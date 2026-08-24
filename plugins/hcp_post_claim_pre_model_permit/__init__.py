@@ -490,6 +490,14 @@ class HCPPermitGuard:
         self._used_permit_ids: set[str] = set()
         self._lock = threading.Lock()
 
+    def model_token_limit(self) -> int:
+        """Return the immutable per-request limit from the verified manifest."""
+
+        value = self._manifest["model_tokens_per_request"]
+        if type(value) is not int or value <= 0:
+            raise ProviderRequestBlocked("HCP_PERMIT_MANIFEST_INVALID")
+        return value
+
     def _nonce(self) -> str:
         value = self._nonce_factory()
         if type(value) is not str or _NONCE.fullmatch(value) is None:
