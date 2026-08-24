@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import socket
 import stat
@@ -24,6 +25,10 @@ def canonical_json(value: object) -> bytes:
         if item is None or type(item) in {bool, int, str}:
             if isinstance(item, str) and any(ord(char) < 0x20 for char in item):
                 raise ValueError("control character")
+            return item
+        if type(item) is float:
+            if not math.isfinite(item):
+                raise ValueError("non-finite number")
             return item
         if isinstance(item, Mapping):
             if any(type(key) is not str for key in item):

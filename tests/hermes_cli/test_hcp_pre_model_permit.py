@@ -360,7 +360,17 @@ def _request() -> dict[str, object]:
         "model": "test-model",
         "messages": [{"role": "user", "content": "exact request"}],
         "max_tokens": 31,
+        "temperature": 0.25,
     }
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_permit_channel_rejects_non_finite_json_numbers(value: float) -> None:
+    from hermes_cli.provider_request_guard import ProviderRequestBlocked
+    from plugins.hcp_post_claim_pre_model_permit.channel import canonical_json
+
+    with pytest.raises(ProviderRequestBlocked, match="HCP_PERMIT_FRAME_INVALID"):
+        canonical_json({"temperature": value})
 
 
 def test_v2_codex_responses_manifest_is_accepted() -> None:
