@@ -235,6 +235,7 @@ def test_guarded_xai_codex_response_is_permitted_immediately_before_provider(
     from agent.chat_completion_helpers import _dispatch_nonstreaming_api_request
     from hermes_cli import plugins
     from hermes_cli.provider_request_guard import ProviderRequestAuthorization
+    from hermes_cli.provider_request_guard import client_transport_identity
 
     events: list[str] = []
     manager = plugins.PluginManager()
@@ -246,6 +247,12 @@ def test_guarded_xai_codex_response_is_permitted_immediately_before_provider(
         assert kwargs["api_mode"] == "codex_responses"
         assert kwargs["transport_mode"] == "non_streaming"
         assert kwargs["model_tokens_requested"] == 73
+        assert kwargs["transport_identity_sha256"] == client_transport_identity(
+            client,
+            expected_base_url="https://api.x.ai/v1",
+            expected_api_key="test-only-key",
+            request_headers={"x-grok-conv-id": "session-9"},
+        )[1]
         return ProviderRequestAuthorization(
             authorization_id="test-only-xai-codex-authorization",
             request_sha256=kwargs["request_sha256"],
@@ -263,6 +270,7 @@ def test_guarded_xai_codex_response_is_permitted_immediately_before_provider(
             assert kwargs["model"] == "grok-4.6"
             assert kwargs["max_output_tokens"] == 73
             assert "stream" not in kwargs
+            assert kwargs["extra_headers"] == {"x-grok-conv-id": "session-9"}
             return SimpleNamespace(id="response-1", output=[])
 
     client = SimpleNamespace(
@@ -301,12 +309,79 @@ def test_guarded_xai_codex_response_is_permitted_immediately_before_provider(
             "model": "grok-4.6",
             "input": "bounded",
             "max_output_tokens": 73,
+            "extra_headers": {"x-grok-conv-id": "session-9"},
         },
         make_client=lambda _reason: client,
     )
 
     assert result.id == "response-1"
     assert events == ["permit", "provider"]
+
+
+@pytest.mark.parametrize(
+    "extra_headers",
+    [
+        {"authorization": "different"},
+        {"x-grok-conv-id": "session-9", "x-other": "value"},
+        {"x-grok-conv-id": "bad\r\nvalue"},
+    ],
+)
+def test_guarded_xai_codex_response_rejects_unbound_request_headers(
+    monkeypatch, extra_headers
+) -> None:
+    from agent.chat_completion_helpers import _dispatch_nonstreaming_api_request
+    from hermes_cli import plugins
+    from hermes_cli.provider_request_guard import ProviderRequestBlocked
+
+    manager = plugins.PluginManager()
+    manager._provider_request_guard_required = True
+    manager._provider_request_guard = MagicMock()
+    monkeypatch.setattr(plugins, "_plugin_manager", manager)
+    provider = MagicMock()
+    client = SimpleNamespace(
+        base_url="https://api.x.ai/v1/",
+        max_retries=0,
+        default_headers={
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Authorization": "Bearer test-only-key",
+        },
+        default_query={},
+        responses=SimpleNamespace(create=provider),
+    )
+    target = SimpleNamespace(
+        api_mode="codex_responses",
+        provider="xai-oauth",
+        model="grok-4.6",
+        api_key="test-only-key",
+        base_url="https://api.x.ai/v1",
+        _provider_request_guard_context={
+            "task_id": "card-7",
+            "turn_id": "turn-1",
+            "api_request_id": "turn-1:api:1",
+            "session_id": "session-9",
+            "profile_id": "implementer",
+            "provider": "xai-oauth",
+            "model": "grok-4.6",
+            "api_mode": "codex_responses",
+            "api_call_count": 1,
+        },
+    )
+
+    with pytest.raises(ProviderRequestBlocked, match="TRANSPORT_UNSUPPORTED"):
+        _dispatch_nonstreaming_api_request(
+            target,
+            {
+                "model": "grok-4.6",
+                "input": "bounded",
+                "max_output_tokens": 73,
+                "extra_headers": extra_headers,
+            },
+            make_client=lambda _reason: client,
+        )
+
+    manager._provider_request_guard.assert_not_called()
+    provider.assert_not_called()
 
 
 def test_guarded_codex_response_rejects_streaming_from_extra_body(

@@ -563,6 +563,39 @@ def canonical_model_request(request: Mapping[str, Any]) -> dict[str, Any]:
     return canonical_sdk_request(value)
 
 
+def canonical_provider_request_headers(value: object) -> dict[str, str]:
+    """Return the sole request-local header allowed on guarded xAI calls.
+
+    xAI's Responses transport derives ``x-grok-conv-id`` from the current
+    session/cache scope.  It is request-local rather than an OpenAI-client
+    default, so bind its exact value into the transport identity instead of
+    either dropping it or allowing an arbitrary SDK ``extra_headers`` escape.
+    """
+
+    if value is None:
+        return {}
+    if type(value) is not dict:
+        raise ProviderRequestBlocked("PROVIDER_REQUEST_TRANSPORT_UNSUPPORTED")
+    if not value:
+        return {}
+    if len(value) != 1:
+        raise ProviderRequestBlocked("PROVIDER_REQUEST_TRANSPORT_UNSUPPORTED")
+    raw_name, raw_value = next(iter(value.items()))
+    if type(raw_name) is not str or raw_name.strip().lower() != "x-grok-conv-id":
+        raise ProviderRequestBlocked("PROVIDER_REQUEST_TRANSPORT_UNSUPPORTED")
+    if (
+        type(raw_value) is not str
+        or raw_value != raw_value.strip()
+        or not 1 <= len(raw_value) <= 256
+        or any(
+            ord(character) < 0x21 or ord(character) > 0x7E
+            for character in raw_value
+        )
+    ):
+        raise ProviderRequestBlocked("PROVIDER_REQUEST_TRANSPORT_UNSUPPORTED")
+    return {"x-grok-conv-id": raw_value}
+
+
 def endpoint_origin(base_url: str) -> str:
     """Return a credential-free, path-free origin for permit identity binding."""
 
@@ -605,6 +638,7 @@ def client_transport_identity(
     *,
     expected_base_url: str,
     expected_api_key: str,
+    request_headers: Mapping[str, str] | None = None,
 ) -> tuple[str, str]:
     """Validate and hash the actual request client's credential-free route.
 
@@ -655,11 +689,14 @@ def client_transport_identity(
         or normalized_headers.get("authorization") != f"Bearer {expected_api_key}"
     ):
         raise ProviderRequestBlocked("PROVIDER_REQUEST_CREDENTIAL_MISMATCH")
-    identity = {
+    normalized_request_headers = canonical_provider_request_headers(request_headers)
+    identity: dict[str, object] = {
         "endpoint_base_url": actual_endpoint,
         "default_headers": normalized_headers,
         "default_query": {},
     }
+    if normalized_request_headers:
+        identity["request_headers"] = normalized_request_headers
     return endpoint_origin(actual_endpoint), canonical_request_sha256(identity)
 
 
@@ -712,6 +749,7 @@ __all__ = [
     "canonical_request_sha256",
     "canonical_sdk_request",
     "canonical_model_request",
+    "canonical_provider_request_headers",
     "endpoint_origin",
     "ensure_authorization_current",
     "consume_provider_tool_invocation",

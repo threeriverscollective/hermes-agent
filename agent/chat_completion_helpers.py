@@ -932,6 +932,7 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
                 ProviderRequestBlocked,
                 begin_provider_request_authorization,
                 canonical_model_request,
+                canonical_provider_request_headers,
                 canonical_sdk_request,
                 client_transport_identity,
                 discard_provider_request_authorization,
@@ -943,7 +944,14 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
                 raise ProviderRequestBlocked(
                     "PROVIDER_REQUEST_CONTEXT_UNAVAILABLE"
                 )
-            if any(api_kwargs.get(key) for key in ("extra_headers", "extra_query")):
+            request_headers = canonical_provider_request_headers(
+                api_kwargs.get("extra_headers")
+            )
+            if request_headers and agent.provider != "xai-oauth":
+                raise ProviderRequestBlocked(
+                    "PROVIDER_REQUEST_TRANSPORT_UNSUPPORTED"
+                )
+            if api_kwargs.get("extra_query"):
                 raise ProviderRequestBlocked(
                     "PROVIDER_REQUEST_TRANSPORT_UNSUPPORTED"
                 )
@@ -964,6 +972,7 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
                 request_client,
                 expected_base_url=agent.base_url,
                 expected_api_key=agent.api_key,
+                request_headers=request_headers,
             )
             token_fields = [
                 wire_request[key]
@@ -992,6 +1001,7 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
                     for key, value in api_kwargs.items()
                     if key in {"timeout"}
                 },
+                **({"extra_headers": request_headers} if request_headers else {}),
                 **sdk_request,
             }
             api_kwargs.pop("stream", None)
