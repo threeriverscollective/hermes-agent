@@ -15457,7 +15457,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         user_message=agent_message,
                         conversation_history=self.conversation_history[:-1],  # Exclude the message we just added
                         stream_callback=stream_callback,
-                        task_id=self.session_id,
+                        # A dispatcher-owned Kanban card is the task authority.
+                        # Its exact identity is inherited separately by the
+                        # agent facade; do not replace it with this CLI session.
+                        task_id=(
+                            None
+                            if os.environ.get("HERMES_KANBAN_TASK", "").strip()
+                            else self.session_id
+                        ),
                         persist_user_message=_persist_clean_user_message,
                         moa_config=_moa_cfg,
                     )

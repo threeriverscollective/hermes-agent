@@ -195,6 +195,82 @@ def test_chat_persists_clean_input_when_a_queued_note_changes_api_message():
     assert agent.captured["persist_user_message"] == "clean prompt"
 
 
+def test_chat_defers_task_identity_to_managed_kanban_card(monkeypatch):
+    """A dispatcher-owned card, not the CLI session, supplies task authority."""
+    cli = _make_cli()
+
+    class _CaptureAgent(_StubAgent):
+        def __init__(self, session_id):
+            super().__init__(session_id, turn_seconds=0)
+            self.captured = None
+
+        def run_conversation(self, **kwargs):
+            self.captured = kwargs
+            return {
+                "final_response": "done",
+                "messages": [{"role": "assistant", "content": "done"}],
+                "api_calls": 1,
+                "completed": True,
+                "partial": True,
+                "response_previewed": True,
+            }
+
+    agent = _CaptureAgent(cli.session_id)
+    cli.agent = agent
+    cli._interrupt_queue = queue.Queue()
+    cli._pending_input = queue.Queue()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "card-7")
+
+    with patch.object(cli, "_ensure_runtime_credentials", return_value=True), \
+         patch.object(cli, "_resolve_turn_agent_config", return_value={
+             "signature": cli._active_agent_route_signature,
+             "model": None, "runtime": None, "request_overrides": None,
+         }), \
+         patch.object(cli, "_init_agent", return_value=True):
+        cli.chat("managed work")
+
+    assert agent.captured is not None
+    assert agent.captured["task_id"] is None
+
+
+def test_chat_uses_session_identity_outside_managed_kanban(monkeypatch):
+    """Ordinary interactive chat retains its existing session task identity."""
+    cli = _make_cli()
+
+    class _CaptureAgent(_StubAgent):
+        def __init__(self, session_id):
+            super().__init__(session_id, turn_seconds=0)
+            self.captured = None
+
+        def run_conversation(self, **kwargs):
+            self.captured = kwargs
+            return {
+                "final_response": "done",
+                "messages": [{"role": "assistant", "content": "done"}],
+                "api_calls": 1,
+                "completed": True,
+                "partial": True,
+                "response_previewed": True,
+            }
+
+    agent = _CaptureAgent(cli.session_id)
+    cli.agent = agent
+    cli._interrupt_queue = queue.Queue()
+    cli._pending_input = queue.Queue()
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+
+    with patch.object(cli, "_ensure_runtime_credentials", return_value=True), \
+         patch.object(cli, "_resolve_turn_agent_config", return_value={
+             "signature": cli._active_agent_route_signature,
+             "model": None, "runtime": None, "request_overrides": None,
+         }), \
+         patch.object(cli, "_init_agent", return_value=True):
+        cli.chat("ordinary work")
+
+    assert agent.captured is not None
+    assert agent.captured["task_id"] == cli.session_id
+
+
 def test_chat_preserves_clean_multimodal_input_when_note_changes_api_message():
     """A queued note forwards original native parts as the persistence override."""
     cli = _make_cli()
