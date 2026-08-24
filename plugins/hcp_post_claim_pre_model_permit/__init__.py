@@ -38,7 +38,7 @@ from hermes_cli.provider_request_guard import (
 from .channel import UnixSocketPermitTransport, canonical_json
 
 
-MANIFEST_SCHEMA_VERSION = "hermes.hcp.pre-model-permit-client.v1"
+MANIFEST_SCHEMA_VERSION = "hermes.hcp.pre-model-permit-client.v2"
 WIRE_SCHEMA_VERSION = "hermes.hcp.pre-model-permit-wire.v1"
 RESULT_SCHEMA_VERSION = "hermes.hcp.pre-model-permit-result.v1"
 SUBJECT_SCHEMA_VERSION = "hermes.hcp.worker-subject.v1"
@@ -99,6 +99,8 @@ _MANIFEST_KEYS = {
     "server_key_id",
     "permit_ttl_seconds",
     "model_tokens_per_request",
+    "reasoning_effort",
+    "transport_mode",
     "snapshot",
 }
 _PERMIT_KEYS = {
@@ -310,8 +312,22 @@ def _validate_manifest(value: object) -> dict[str, object]:
     for key in ("binding_digest", "claim_lock_sha256"):
         if _DIGEST.fullmatch(str(manifest.get(key))) is None:
             raise ProviderRequestBlocked("HCP_PERMIT_MANIFEST_INVALID")
+    reasoning_effort = manifest.get("reasoning_effort")
+    if manifest["api_mode"] == "codex_responses":
+        _text(reasoning_effort, "HCP_PERMIT_MANIFEST_INVALID")
     if (
-        manifest["api_mode"] != "chat_completions"
+        manifest.get("transport_mode") != "non_streaming"
+        or manifest["api_mode"] not in {"chat_completions", "codex_responses"}
+        or (
+            manifest["api_mode"] == "chat_completions"
+            and reasoning_effort is not None
+        )
+        or (
+            manifest["api_mode"] == "codex_responses"
+            and (
+                manifest["provider"] != "openai-codex"
+            )
+        )
         or type(manifest.get("permit_ttl_seconds")) is not int
         or not 1 <= manifest["permit_ttl_seconds"] <= 30
         or type(manifest.get("model_tokens_per_request")) is not int
@@ -513,7 +529,7 @@ class HCPPermitGuard:
             or api_mode != manifest["api_mode"]
             or endpoint_origin != manifest["endpoint_origin"]
             or _DIGEST.fullmatch(transport_identity_sha256) is None
-            or transport_mode != "non_streaming"
+            or transport_mode != manifest["transport_mode"]
             or request.get("model") != model
             or type(api_call_count) is not int
             or api_call_count < 0

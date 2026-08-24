@@ -83,7 +83,7 @@ def _snapshot() -> dict[str, object]:
 
 def _manifest() -> dict[str, object]:
     return {
-        "schema_version": "hermes.hcp.pre-model-permit-client.v1",
+        "schema_version": "hermes.hcp.pre-model-permit-client.v2",
         "task_id": "card-7",
         "generation_id": "generation-3",
         "board_id": "hcp-board",
@@ -100,6 +100,8 @@ def _manifest() -> dict[str, object]:
         "server_key_id": "hcp-server-key-1",
         "permit_ttl_seconds": 15,
         "model_tokens_per_request": 512,
+        "reasoning_effort": None,
+        "transport_mode": "non_streaming",
         "snapshot": _snapshot(),
     }
 
@@ -359,6 +361,80 @@ def _request() -> dict[str, object]:
         "messages": [{"role": "user", "content": "exact request"}],
         "max_tokens": 31,
     }
+
+
+def test_v2_codex_responses_manifest_is_accepted() -> None:
+    from plugins.hcp_post_claim_pre_model_permit import HCPPermitGuard
+
+    manifest = _manifest()
+    manifest.update(
+        {
+            "provider": "openai-codex",
+            "api_mode": "codex_responses",
+            "reasoning_effort": "high",
+        }
+    )
+    guard = HCPPermitGuard(
+        transport=SimpleNamespace(exchange=lambda _request: None),
+        manifest=manifest,
+        peer_private_key=PEER_KEY,
+        server_public_key=SERVER_KEY.public_key(),
+        hermes_run_id="42",
+    )
+
+    assert guard._manifest["schema_version"] == (
+        "hermes.hcp.pre-model-permit-client.v2"
+    )
+    assert guard._manifest["api_mode"] == "codex_responses"
+    assert guard._manifest["reasoning_effort"] == "high"
+    assert guard._manifest["transport_mode"] == "non_streaming"
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"schema_version": "hermes.hcp.pre-model-permit-client.v1"},
+        {"api_mode": "responses"},
+        {"transport_mode": "streaming"},
+        {"api_mode": "chat_completions", "reasoning_effort": "high"},
+        {
+            "api_mode": "codex_responses",
+            "provider": "openai-codex",
+            "reasoning_effort": None,
+        },
+        {
+            "api_mode": "codex_responses",
+            "provider": "openai",
+            "reasoning_effort": "high",
+        },
+        {
+            "api_mode": "codex_responses",
+            "provider": "openai-codex",
+            "reasoning_effort": "high\nlow",
+        },
+        {
+            "api_mode": "codex_responses",
+            "provider": "openai-codex",
+            "reasoning_effort": "x" * 4097,
+        },
+    ],
+)
+def test_v2_manifest_refuses_inconsistent_route(
+    changes: dict[str, object],
+) -> None:
+    from hermes_cli.provider_request_guard import ProviderRequestBlocked
+    from plugins.hcp_post_claim_pre_model_permit import HCPPermitGuard
+
+    manifest = _manifest()
+    manifest.update(changes)
+    with pytest.raises(ProviderRequestBlocked, match="HCP_PERMIT_MANIFEST_INVALID"):
+        HCPPermitGuard(
+            transport=SimpleNamespace(exchange=lambda _request: None),
+            manifest=manifest,
+            peer_private_key=PEER_KEY,
+            server_public_key=SERVER_KEY.public_key(),
+            hermes_run_id="42",
+        )
 
 
 def test_exact_hcp_exchanges_are_signed_and_each_attempt_gets_a_new_connection(
