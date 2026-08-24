@@ -1386,7 +1386,21 @@ def build_environment_hints() -> str:
             hints.append(_WINDOWS_BASH_SHELL_HINT)
     else:
         # --- Remote backend block (host info suppressed) ---
-        probe = _probe_remote_backend(backend)
+        # A required-resource Docker worker must be the only Docker object
+        # created for the task.  The normal prompt-build probe creates a
+        # short-lived backend container, which would violate that accounting
+        # (and can itself fail before the real worker starts).  The HCP
+        # boundary sets this opt-in environment flag before prompt assembly;
+        # use the existing static fallback text in that mode.  Other
+        # backends, and the default Docker mode, retain the live probe.
+        require_resource_limits = (
+            backend == "docker"
+            and os.getenv("TERMINAL_DOCKER_REQUIRE_RESOURCE_LIMITS", "")
+            .strip()
+            .lower()
+            in {"true", "1", "yes"}
+        )
+        probe = None if require_resource_limits else _probe_remote_backend(backend)
         if probe:
             hints.append(
                 f"Terminal backend: {backend}. Your `terminal`, `read_file`, "

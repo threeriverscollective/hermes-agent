@@ -771,6 +771,50 @@ class TestEnvironmentHints:
         assert "Terminal backend: docker" in result
         assert "inside" in result.lower()
 
+    def test_required_docker_resource_mode_uses_static_fallback_without_probe(
+        self, monkeypatch
+    ):
+        """Required-resource workers must not create a prompt probe container."""
+        import agent.prompt_builder as _pb
+
+        monkeypatch.setattr(_pb, "is_wsl", lambda: False)
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        monkeypatch.setenv("TERMINAL_DOCKER_REQUIRE_RESOURCE_LIMITS", "true")
+        monkeypatch.delenv("HERMES_ENVIRONMENT_HINT", raising=False)
+
+        def _probe_must_not_run(_backend):
+            pytest.fail("required-resource Docker mode must skip the backend probe")
+
+        monkeypatch.setattr(_pb, "_probe_remote_backend", _probe_must_not_run)
+        _pb._clear_backend_probe_cache()
+
+        result = _pb.build_environment_hints()
+
+        assert "Terminal backend: docker" in result
+        assert "inside a Docker container (Linux)" in result
+        assert "backend probe didn't respond" in result
+
+    def test_default_docker_mode_still_runs_backend_probe(self, monkeypatch):
+        """Without the opt-in flag, preserve the existing live probe behavior."""
+        import agent.prompt_builder as _pb
+
+        monkeypatch.setattr(_pb, "is_wsl", lambda: False)
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        monkeypatch.delenv("TERMINAL_DOCKER_REQUIRE_RESOURCE_LIMITS", raising=False)
+        monkeypatch.delenv("HERMES_ENVIRONMENT_HINT", raising=False)
+        _pb._clear_backend_probe_cache()
+        calls = []
+        monkeypatch.setattr(
+            _pb,
+            "_probe_remote_backend",
+            lambda backend: calls.append(backend) or "  OS: Linux 6.8.0",
+        )
+
+        result = _pb.build_environment_hints()
+
+        assert calls == ["docker"]
+        assert "OS: Linux 6.8.0" in result
+
     def test_build_environment_hints_uses_terminal_cwd_over_launch_dir(self, monkeypatch, tmp_path):
         """THE BUG: gateway/cron set TERMINAL_CWD but the prompt emitted os.getcwd()
         (the daemon launch dir). Regression for #24882/#24969/#27383/#29265."""
