@@ -23,8 +23,8 @@ def canonical_json(value: object) -> bytes:
 
     def normalize(item: object) -> object:
         if item is None or type(item) in {bool, int, str}:
-            if isinstance(item, str) and any(ord(char) < 0x20 for char in item):
-                raise ValueError("control character")
+            if isinstance(item, str):
+                item.encode("utf-8", errors="strict")
             return item
         if type(item) is float:
             if not math.isfinite(item):
@@ -33,6 +33,8 @@ def canonical_json(value: object) -> bytes:
         if isinstance(item, Mapping):
             if any(type(key) is not str for key in item):
                 raise ValueError("non-string key")
+            for key in item:
+                normalize(key)
             return {key: normalize(item[key]) for key in sorted(item)}
         if isinstance(item, (tuple, list)):
             return [normalize(child) for child in item]

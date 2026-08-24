@@ -358,7 +358,7 @@ def _guard(path: Path):
 def _request() -> dict[str, object]:
     return {
         "model": "test-model",
-        "messages": [{"role": "user", "content": "exact request"}],
+        "messages": [{"role": "user", "content": "exact\nrequest"}],
         "max_tokens": 31,
         "temperature": 0.25,
     }
@@ -371,6 +371,15 @@ def test_permit_channel_rejects_non_finite_json_numbers(value: float) -> None:
 
     with pytest.raises(ProviderRequestBlocked, match="HCP_PERMIT_FRAME_INVALID"):
         canonical_json({"temperature": value})
+
+
+@pytest.mark.parametrize("as_key", [False, True])
+def test_permit_channel_rejects_non_utf8_string(as_key: bool) -> None:
+    from hermes_cli.provider_request_guard import ProviderRequestBlocked
+    from plugins.hcp_post_claim_pre_model_permit.channel import canonical_json
+
+    with pytest.raises(ProviderRequestBlocked, match="HCP_PERMIT_FRAME_INVALID"):
+        canonical_json({"\ud800": "prompt"} if as_key else {"prompt": "\ud800"})
 
 
 def test_v2_codex_responses_manifest_is_accepted() -> None:
