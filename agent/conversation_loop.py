@@ -7228,6 +7228,44 @@ def run_conversation(
                                 pass
                     break
 
+                # A managed kanban worker is finished when its exact terminal
+                # lifecycle write has succeeded.  Asking the provider for a
+                # prose epilogue after kanban_complete/kanban_block is both
+                # wasteful and incorrect: the card is already terminal, so a
+                # permit host must refuse that extra provider request.  Match
+                # only the current call ids and exact task/run-bound result.
+                try:
+                    from agent.kanban_stop import (
+                        successful_current_kanban_terminal_transition,
+                    )
+
+                    _kanban_terminal_tool = (
+                        successful_current_kanban_terminal_transition(
+                            tool_calls=assistant_message.tool_calls,
+                            messages=messages,
+                        )
+                    )
+                except Exception:
+                    logger.debug(
+                        "kanban terminal transition check failed",
+                        exc_info=True,
+                    )
+                    _kanban_terminal_tool = None
+
+                if _kanban_terminal_tool:
+                    final_response = (
+                        "Managed kanban terminal transition accepted: "
+                        f"{_kanban_terminal_tool}."
+                    )
+                    _turn_exit_reason = (
+                        "kanban_terminal_tool_success("
+                        f"{_kanban_terminal_tool})"
+                    )
+                    agent._touch_activity(
+                        f"terminal kanban tool committed: {_kanban_terminal_tool}"
+                    )
+                    break
+
                 # Reset per-turn retry counters after successful tool
                 # execution so a single truncation doesn't poison the
                 # entire conversation.

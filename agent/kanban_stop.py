@@ -13,6 +13,7 @@ loop continues instead of exiting.
 
 from __future__ import annotations
 
+import json
 import os
 from typing import Any, Iterable, Optional
 
@@ -66,6 +67,76 @@ def session_called_kanban_terminal(messages: Iterable[dict] | None) -> bool:
     return False
 
 
+def successful_current_kanban_terminal_transition(
+    *,
+    tool_calls: Iterable[Any] | None,
+    messages: Iterable[dict] | None,
+) -> Optional[str]:
+    """Return the successful terminal tool from the current managed turn.
+
+    A dispatcher worker does not need another provider request after its exact
+    ``kanban_complete`` or ``kanban_block`` call has committed.  Match only
+    tool results from *tool_calls* and require the result to bind the current
+    task and run.  This prevents a stale result from an earlier turn, another
+    card, or another run from terminating the conversation.
+    """
+    if not kanban_stop_nudge_enabled() or not tool_calls or not messages:
+        return None
+
+    task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    run_id_text = (os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
+    try:
+        run_id = int(run_id_text)
+    except (TypeError, ValueError):
+        return None
+    if run_id <= 0:
+        return None
+
+    current: dict[str, str] = {}
+    for tool_call in tool_calls:
+        name = _tool_call_name(tool_call)
+        if name not in _TERMINAL_KANBAN_TOOLS:
+            continue
+        if isinstance(tool_call, dict):
+            tool_call_id = str(tool_call.get("id") or "")
+        else:
+            tool_call_id = str(getattr(tool_call, "id", "") or "")
+        if tool_call_id:
+            current[tool_call_id] = name
+    if not current:
+        return None
+
+    # Read newest-first and evaluate at most one result per current call id.
+    # Providers may reuse a call id across turns; an older successful result
+    # must never override the current call's failed result.
+    checked: set[str] = set()
+    for message in reversed(list(messages)):
+        if not isinstance(message, dict) or message.get("role") != "tool":
+            continue
+        tool_call_id = str(message.get("tool_call_id") or "")
+        expected_name = current.get(tool_call_id)
+        if expected_name is None or str(message.get("name") or "") != expected_name:
+            continue
+        if tool_call_id in checked:
+            continue
+        checked.add(tool_call_id)
+        content = message.get("content")
+        if not isinstance(content, str):
+            continue
+        try:
+            payload = json.loads(content)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(payload, dict) or payload.get("ok") is not True:
+            continue
+        if payload.get("task_id") != task_id:
+            continue
+        if payload.get("run_id") != run_id:
+            continue
+        return expected_name
+    return None
+
+
 def build_kanban_stop_nudge(
     *,
     messages: Iterable[dict] | None = None,
@@ -105,4 +176,5 @@ __all__ = [
     "build_kanban_stop_nudge",
     "kanban_stop_nudge_enabled",
     "session_called_kanban_terminal",
+    "successful_current_kanban_terminal_transition",
 ]

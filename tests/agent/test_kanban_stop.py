@@ -8,6 +8,7 @@ from agent.kanban_stop import (
     build_kanban_stop_nudge,
     kanban_stop_nudge_enabled,
     session_called_kanban_terminal,
+    successful_current_kanban_terminal_transition,
 )
 
 
@@ -74,6 +75,125 @@ def test_no_nudge_after_kanban_complete(clear_kanban_env):
     assert build_kanban_stop_nudge(messages=messages) is None
 
 
+def test_current_successful_terminal_result_binds_exact_task_and_run(
+    clear_kanban_env,
+):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    clear_kanban_env.setenv("HERMES_KANBAN_RUN_ID", "42")
+    tool_calls = [
+        {
+            "id": "call-current",
+            "type": "function",
+            "function": {"name": "kanban_complete", "arguments": "{}"},
+        }
+    ]
+    messages = [
+        {
+            "role": "tool",
+            "name": "kanban_complete",
+            "tool_call_id": "call-current",
+            "content": '{"ok": true, "task_id": "t_abc", "run_id": 42}',
+        }
+    ]
+
+    assert successful_current_kanban_terminal_transition(
+        tool_calls=tool_calls,
+        messages=messages,
+    ) == "kanban_complete"
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        '{"error": "not completed"}',
+        '{"ok": true, "task_id": "t_other", "run_id": 42}',
+        '{"ok": true, "task_id": "t_abc", "run_id": 41}',
+    ],
+)
+def test_terminal_result_rejects_error_or_cross_authority_result(
+    clear_kanban_env,
+    content,
+):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    clear_kanban_env.setenv("HERMES_KANBAN_RUN_ID", "42")
+    tool_calls = [
+        {
+            "id": "call-current",
+            "type": "function",
+            "function": {"name": "kanban_complete", "arguments": "{}"},
+        }
+    ]
+    messages = [
+        {
+            "role": "tool",
+            "name": "kanban_complete",
+            "tool_call_id": "call-current",
+            "content": content,
+        }
+    ]
+
+    assert successful_current_kanban_terminal_transition(
+        tool_calls=tool_calls,
+        messages=messages,
+    ) is None
+
+
+def test_terminal_result_rejects_stale_tool_call_id(clear_kanban_env):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    clear_kanban_env.setenv("HERMES_KANBAN_RUN_ID", "42")
+    tool_calls = [
+        {
+            "id": "call-current",
+            "type": "function",
+            "function": {"name": "kanban_complete", "arguments": "{}"},
+        }
+    ]
+    messages = [
+        {
+            "role": "tool",
+            "name": "kanban_complete",
+            "tool_call_id": "call-stale",
+            "content": '{"ok": true, "task_id": "t_abc", "run_id": 42}',
+        }
+    ]
+
+    assert successful_current_kanban_terminal_transition(
+        tool_calls=tool_calls,
+        messages=messages,
+    ) is None
+
+
+def test_current_failure_wins_over_reused_stale_success(clear_kanban_env):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    clear_kanban_env.setenv("HERMES_KANBAN_RUN_ID", "42")
+    tool_calls = [
+        {
+            "id": "call-reused",
+            "type": "function",
+            "function": {"name": "kanban_complete", "arguments": "{}"},
+        }
+    ]
+    messages = [
+        {
+            "role": "tool",
+            "name": "kanban_complete",
+            "tool_call_id": "call-reused",
+            "content": '{"ok": true, "task_id": "t_abc", "run_id": 42}',
+        },
+        {
+            "role": "tool",
+            "name": "kanban_complete",
+            "tool_call_id": "call-reused",
+            "content": '{"error": "current handoff rejected"}',
+        },
+    ]
+
+    assert successful_current_kanban_terminal_transition(
+        tool_calls=tool_calls,
+        messages=messages,
+    ) is None
+
+
 
 
 
@@ -84,7 +204,5 @@ def test_no_nudge_after_kanban_complete(clear_kanban_env):
 # without a terminal call, the dispatcher's bounded retry (streak of 3)
 # handles it.  See also tests/hermes_cli/test_kanban_core_functionality.py
 # for the dispatcher-side streak tests.
-
-
 
 

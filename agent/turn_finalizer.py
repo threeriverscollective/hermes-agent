@@ -194,12 +194,16 @@ def finalize_turn(
 
     # Determine if conversation completed successfully
     normal_text_response = str(_turn_exit_reason).startswith("text_response(")
+    normal_kanban_terminal = str(_turn_exit_reason).startswith(
+        "kanban_terminal_tool_success("
+    )
     completed = (
         final_response is not None
         and not failed
         and (
             api_call_count < agent.max_iterations
             or normal_text_response
+            or normal_kanban_terminal
         )
     )
 
