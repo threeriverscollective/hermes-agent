@@ -248,6 +248,26 @@ def test_tool_is_unavailable_without_exact_hcp_runtime_binding(monkeypatch) -> N
     assert hcp_diagnostics_available() is False
 
 
+def test_dispatcher_owned_keys_may_be_outside_runtime_root(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config_path, config, _, _ = _binding(tmp_path)
+    dispatcher_root = tmp_path / "dispatcher-authority"
+    dispatcher_root.mkdir(mode=0o700)
+    for field, filename in (
+        ("request_signing", "dispatcher.key"),
+        ("response_verification", "server.pub"),
+    ):
+        source = Path(config[field]["key_path"])
+        target = dispatcher_root / filename
+        source.replace(target)
+        config[field]["key_path"] = str(target)
+    _write_private(config_path, _canonical(config))
+    monkeypatch.setenv("HCP_DIAGNOSTICS_TOOL_CONFIG", str(config_path))
+
+    assert hcp_diagnostics_available() is True
+
+
 def test_schema_exposes_only_stable_opaque_offer_id() -> None:
     parameters = HCP_DIAGNOSTICS_READ_SCHEMA["parameters"]
     assert set(parameters["properties"]) == {"offer_id"}

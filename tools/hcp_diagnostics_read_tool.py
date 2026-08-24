@@ -226,8 +226,6 @@ def _load_binding() -> dict[str, object]:
             raise HcpDiagnosticsToolRefusal("BROKER_TRANSPORT_AUTH_INVALID")
         _token(row["signing_identity"])
         _token(row["key_id"])
-        if Path(str(row["key_path"])).parent != parent:
-            raise HcpDiagnosticsToolRefusal("BROKER_TRANSPORT_AUTH_INVALID")
         _read_private_file(row["key_path"], row["key_sha256"])
     return value
 
