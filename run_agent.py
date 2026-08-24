@@ -8654,19 +8654,33 @@ class AIAgent:
                         with durable_turn_lease_activity_lock:
                             durable_turn_lease_turn_active = True
                         durable_turn_lease_thread.start()
-                    result = run_conversation(
-                        self,
-                        user_message,
-                        system_message,
-                        conversation_history,
-                        effective_task_id,
-                        stream_callback,
-                        persist_user_message,
-                        persist_user_timestamp=persist_user_timestamp,
-                        persist_user_display_kind=persist_user_display_kind,
-                        persist_user_display_metadata=persist_user_display_metadata,
-                        moa_config=moa_config,
-                    )
+                    try:
+                        result = run_conversation(
+                            self,
+                            user_message,
+                            system_message,
+                            conversation_history,
+                            effective_task_id,
+                            stream_callback,
+                            persist_user_message,
+                            persist_user_timestamp=persist_user_timestamp,
+                            persist_user_display_kind=persist_user_display_kind,
+                            persist_user_display_metadata=persist_user_display_metadata,
+                            moa_config=moa_config,
+                        )
+                    except BaseException as exc:
+                        from hermes_cli.provider_request_guard import (
+                            ProviderRequestBlocked,
+                        )
+
+                        if not isinstance(exc, ProviderRequestBlocked):
+                            raise
+                        from hermes_cli.kanban_db import record_provider_guard_hold
+
+                        hold = record_provider_guard_hold(exc.error_code)
+                        if hold is None:
+                            raise
+                        result = hold
                 finally:
                     # The lease remains held through relay/task finalization, but
                     # those post-loop steps must not receive a late refresh
