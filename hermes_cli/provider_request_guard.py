@@ -59,6 +59,27 @@ class ProviderRequestGuardRegistrationError(PermissionError):
     """Raised when more than one plugin tries to own provider authorization."""
 
 
+def bind_managed_task_id(task_id: object) -> object:
+    """Bind one caller task identity to the exact host-managed task.
+
+    Dispatcher workers use ``HERMES_KANBAN_TASK``.  A bounded HCP direct
+    model invocation is not a Kanban worker (and must not gain Kanban tools),
+    so HCP uses ``HCP_MANAGED_TASK_ID`` for the same identity binding.  The
+    two authorities may coexist only when they name the same task.
+    """
+
+    kanban_task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
+    hcp_task_id = os.environ.get("HCP_MANAGED_TASK_ID", "").strip()
+    if kanban_task_id and hcp_task_id and kanban_task_id != hcp_task_id:
+        raise ProviderRequestBlocked("PROVIDER_TASK_ID_MISMATCH")
+    managed_task_id = kanban_task_id or hcp_task_id
+    if not managed_task_id:
+        return task_id
+    if task_id is not None and str(task_id).strip() not in {"", managed_task_id}:
+        raise ProviderRequestBlocked("PROVIDER_TASK_ID_MISMATCH")
+    return managed_task_id
+
+
 @dataclass(frozen=True, slots=True)
 class ProviderRequestAuthorization:
     """Internal proof that one guard authorized one immutable request digest."""
@@ -667,6 +688,7 @@ __all__ = [
     "ProviderRequestBlocked",
     "ProviderRequestGuardRegistrationError",
     "ProviderToolInvocationAttestation",
+    "bind_managed_task_id",
     "begin_provider_request_authorization",
     "bind_provider_response_tool_calls",
     "client_transport_identity",

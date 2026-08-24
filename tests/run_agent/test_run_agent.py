@@ -2824,6 +2824,48 @@ class TestRunConversation:
 
         assert caught.value.error_code == "PROVIDER_TASK_ID_MISMATCH"
 
+    def test_hcp_managed_forwarder_uses_exact_card_without_kanban_scope(
+        self, agent, monkeypatch
+    ):
+        """A bounded direct HCP invocation preserves its authorized card ID."""
+        monkeypatch.setenv("HCP_MANAGED_TASK_ID", "card:hcp-7")
+        relay_lease = SimpleNamespace(
+            parent_session_id="",
+            profile_key="/profile",
+            session_id=agent.session_id or "",
+        )
+        coordinator = MagicMock()
+        coordinator.acquire_conversation.return_value = relay_lease
+        coordinator.begin_turn.return_value = object()
+        result = {"final_response": "held", "completed": False, "failed": True}
+
+        with (
+            patch("agent.relay_runtime.SESSION_COORDINATOR", coordinator),
+            patch("agent.relay_runtime.current_profile_key", return_value="/profile"),
+            patch("hermes_cli.observability.relay_shared_metrics.start_task_run"),
+            patch("hermes_cli.observability.relay_shared_metrics.finish_task_run"),
+            patch(
+                "agent.conversation_loop.run_conversation",
+                return_value=result,
+            ) as run_conversation,
+        ):
+            observed = agent.run_conversation("bounded HCP work")
+
+        assert observed is result
+        assert run_conversation.call_args.args[4] == "card:hcp-7"
+
+    def test_managed_task_authorities_must_not_disagree(
+        self, agent, monkeypatch
+    ):
+        from hermes_cli.provider_request_guard import ProviderRequestBlocked
+
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "card:kanban")
+        monkeypatch.setenv("HCP_MANAGED_TASK_ID", "card:hcp")
+        with pytest.raises(ProviderRequestBlocked) as caught:
+            agent.run_conversation("conflicting managed work")
+
+        assert caught.value.error_code == "PROVIDER_TASK_ID_MISMATCH"
+
     def test_conversation_loop_rejects_conflicting_task_identity(
         self, agent, monkeypatch
     ):

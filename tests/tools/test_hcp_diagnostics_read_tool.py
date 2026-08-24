@@ -300,6 +300,7 @@ def test_first_pilot_inventory_is_exact_terminal_plus_host_diagnostics(
 ) -> None:
     config_path, _, _, _ = _binding(tmp_path)
     monkeypatch.setenv("HCP_DIAGNOSTICS_TOOL_CONFIG", str(config_path))
+    monkeypatch.setenv("HCP_MANAGED_TASK_ID", "card:1")
     monkeypatch.setenv("TERMINAL_ENV", "local")
     _clear_tool_defs_cache()
     try:
