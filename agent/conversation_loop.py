@@ -7148,36 +7148,37 @@ def run_conversation(
                 _guard_context = getattr(
                     agent, "_provider_request_guard_context", None
                 )
-                if provider_request_guard_active():
-                    if not isinstance(_guard_context, dict):
-                        raise ProviderRequestBlocked(
-                            "PROVIDER_REQUEST_CONTEXT_UNAVAILABLE"
-                        )
-                    from hermes_cli.provider_request_guard import (
-                        bind_provider_response_tool_calls,
-                        discard_provider_request_authorization,
-                    )
-
-                    bind_provider_response_tool_calls(
-                        task_id=_guard_context.get("task_id"),
-                        session_id=_guard_context.get("session_id"),
-                        turn_id=_guard_context.get("turn_id"),
-                        api_request_id=_guard_context.get("api_request_id"),
-                        tool_calls=[
-                            (
-                                tc.id,
-                                tc.function.name,
-                                tc.function.arguments,
-                            )
-                            for tc in assistant_message.tool_calls
-                        ],
-                        finish_reason=str(finish_reason or ""),
-                        assistant_content=str(assistant_message.content or ""),
-                        response_observed_at_unix_ms=(
-                            _provider_response_observed_at_unix_ms
-                        ),
-                    )
+                _guard_active_for_response = provider_request_guard_active()
                 try:
+                    if _guard_active_for_response:
+                        if not isinstance(_guard_context, dict):
+                            raise ProviderRequestBlocked(
+                                "PROVIDER_REQUEST_CONTEXT_UNAVAILABLE"
+                            )
+                        from hermes_cli.provider_request_guard import (
+                            bind_provider_response_tool_calls,
+                            discard_provider_request_authorization,
+                        )
+
+                        bind_provider_response_tool_calls(
+                            task_id=_guard_context.get("task_id"),
+                            session_id=_guard_context.get("session_id"),
+                            turn_id=_guard_context.get("turn_id"),
+                            api_request_id=_guard_context.get("api_request_id"),
+                            tool_calls=[
+                                (
+                                    tc.id,
+                                    tc.function.name,
+                                    tc.function.arguments,
+                                )
+                                for tc in assistant_message.tool_calls
+                            ],
+                            finish_reason=str(finish_reason or ""),
+                            assistant_content=str(assistant_message.content or ""),
+                            response_observed_at_unix_ms=(
+                                _provider_response_observed_at_unix_ms
+                            ),
+                        )
                     agent._execute_tool_calls(
                         assistant_message,
                         messages,
@@ -7185,7 +7186,7 @@ def run_conversation(
                         api_call_count,
                     )
                 finally:
-                    if provider_request_guard_active() and isinstance(
+                    if _guard_active_for_response and isinstance(
                         _guard_context, dict
                     ):
                         discard_provider_request_authorization(

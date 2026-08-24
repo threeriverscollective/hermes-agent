@@ -622,6 +622,11 @@ def client_transport_identity(
         isinstance(default_query, Mapping) and len(default_query) != 0
     ):
         raise ProviderRequestBlocked("PROVIDER_REQUEST_TRANSPORT_UNSUPPORTED")
+    if (
+        type(getattr(client, "max_retries", None)) is not int
+        or client.max_retries != 0
+    ):
+        raise ProviderRequestBlocked("PROVIDER_REQUEST_TRANSPORT_UNSUPPORTED")
     headers = getattr(client, "default_headers", None)
     if not isinstance(headers, Mapping):
         raise ProviderRequestBlocked("PROVIDER_REQUEST_TRANSPORT_INVALID")

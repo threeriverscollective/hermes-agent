@@ -81,6 +81,7 @@ def _run(agent: AIAgent):
 def _provider_client(callback):
     return SimpleNamespace(
         base_url="https://example.invalid/v1/",
+        max_retries=0,
         default_headers={
             "Accept": "application/json",
             "Content-Type": "application/json",
@@ -266,6 +267,7 @@ def test_guarded_xai_codex_response_is_permitted_immediately_before_provider(
 
     client = SimpleNamespace(
         base_url="https://api.x.ai/v1/",
+        max_retries=0,
         default_headers={
             "Accept": "application/json",
             "Content-Type": "application/json",
@@ -305,6 +307,64 @@ def test_guarded_xai_codex_response_is_permitted_immediately_before_provider(
 
     assert result.id == "response-1"
     assert events == ["permit", "provider"]
+
+
+def test_guarded_codex_response_rejects_streaming_from_extra_body(
+    monkeypatch,
+) -> None:
+    from agent.chat_completion_helpers import _dispatch_nonstreaming_api_request
+    from hermes_cli import plugins
+    from hermes_cli.provider_request_guard import ProviderRequestBlocked
+
+    manager = plugins.PluginManager()
+    manager._provider_request_guard_required = True
+    manager._provider_request_guard = MagicMock()
+    monkeypatch.setattr(plugins, "_plugin_manager", manager)
+    provider = MagicMock()
+    client = SimpleNamespace(
+        base_url="https://api.x.ai/v1/",
+        max_retries=0,
+        default_headers={
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Authorization": "Bearer test-only-key",
+        },
+        default_query={},
+        responses=SimpleNamespace(create=provider),
+    )
+    target = SimpleNamespace(
+        api_mode="codex_responses",
+        provider="xai-oauth",
+        model="grok-4.6",
+        api_key="test-only-key",
+        base_url="https://api.x.ai/v1",
+        _provider_request_guard_context={
+            "task_id": "card-7",
+            "turn_id": "turn-1",
+            "api_request_id": "turn-1:api:1",
+            "session_id": "session-9",
+            "profile_id": "implementer",
+            "provider": "xai-oauth",
+            "model": "grok-4.6",
+            "api_mode": "codex_responses",
+            "api_call_count": 1,
+        },
+    )
+
+    with pytest.raises(ProviderRequestBlocked, match="ROUTE_UNSUPPORTED"):
+        _dispatch_nonstreaming_api_request(
+            target,
+            {
+                "model": "grok-4.6",
+                "input": "bounded",
+                "max_output_tokens": 73,
+                "extra_body": {"stream": True},
+            },
+            make_client=lambda _reason: client,
+        )
+
+    manager._provider_request_guard.assert_not_called()
+    provider.assert_not_called()
 
 
 def test_guard_is_immediately_before_provider(agent, monkeypatch) -> None:
@@ -412,6 +472,7 @@ def test_authorization_expiry_is_rechecked_at_provider_transport(
         ("base_url", "ENDPOINT_MISMATCH"),
         ("default_query", "TRANSPORT_UNSUPPORTED"),
         ("default_headers", "TRANSPORT_UNSUPPORTED"),
+        ("max_retries", "TRANSPORT_UNSUPPORTED"),
     ],
 )
 def test_guard_refuses_unbound_client_transport_state(
@@ -431,6 +492,8 @@ def test_guard_refuses_unbound_client_transport_state(
         client.base_url = "https://different.invalid/alternate/v1/"
     elif mutation == "default_query":
         client.default_query = {"api-version": "unbound"}
+    elif mutation == "max_retries":
+        client.max_retries = 1
     else:
         client.default_headers["X-Unbound-Route"] = "unbound"
     agent._provider_request_guard_context = {
@@ -573,6 +636,7 @@ def test_guard_receives_the_exact_final_model_payload(monkeypatch) -> None:
 
     client = SimpleNamespace(
         base_url="https://example.invalid/v1/",
+        max_retries=0,
         default_headers={
             "Accept": "application/json",
             "Content-Type": "application/json",

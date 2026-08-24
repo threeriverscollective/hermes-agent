@@ -956,6 +956,10 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
                 )
             sdk_request = canonical_sdk_request(api_kwargs)
             wire_request = canonical_model_request(sdk_request)
+            if wire_request.get("stream") not in (None, False):
+                raise ProviderRequestBlocked(
+                    "PROVIDER_REQUEST_ROUTE_UNSUPPORTED"
+                )
             endpoint, transport_identity_sha256 = client_transport_identity(
                 request_client,
                 expected_base_url=agent.base_url,
