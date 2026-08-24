@@ -325,7 +325,8 @@ def _validate_manifest(value: object) -> dict[str, object]:
         or (
             manifest["api_mode"] == "codex_responses"
             and (
-                manifest["provider"] != "openai-codex"
+                    manifest["provider"]
+                    not in {"openai-codex", "xai-oauth"}
             )
         )
         or type(manifest.get("permit_ttl_seconds")) is not int

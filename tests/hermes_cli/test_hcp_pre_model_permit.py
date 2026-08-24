@@ -409,6 +409,34 @@ def test_v2_codex_responses_manifest_is_accepted() -> None:
     assert guard._manifest["transport_mode"] == "non_streaming"
 
 
+def test_v2_xai_oauth_responses_manifest_is_accepted() -> None:
+    from plugins.hcp_post_claim_pre_model_permit import HCPPermitGuard
+
+    manifest = _manifest()
+    manifest.update(
+        {
+            "provider": "xai-oauth",
+            "model": "grok-4.6",
+            "api_mode": "codex_responses",
+            "endpoint_origin": "https://api.x.ai",
+            "reasoning_effort": "xhigh",
+        }
+    )
+    guard = HCPPermitGuard(
+        transport=SimpleNamespace(exchange=lambda _request: None),
+        manifest=manifest,
+        peer_private_key=PEER_KEY,
+        server_public_key=SERVER_KEY.public_key(),
+        hermes_run_id="42",
+    )
+
+    assert guard._manifest["provider"] == "xai-oauth"
+    assert guard._manifest["model"] == "grok-4.6"
+    assert guard._manifest["api_mode"] == "codex_responses"
+    assert guard._manifest["endpoint_origin"] == "https://api.x.ai"
+    assert guard._manifest["reasoning_effort"] == "xhigh"
+
+
 @pytest.mark.parametrize(
     "changes",
     [
@@ -425,6 +453,11 @@ def test_v2_codex_responses_manifest_is_accepted() -> None:
             "api_mode": "codex_responses",
             "provider": "openai",
             "reasoning_effort": "high",
+        },
+        {
+            "api_mode": "codex_responses",
+            "provider": "xai",
+            "reasoning_effort": "xhigh",
         },
         {
             "api_mode": "codex_responses",
