@@ -216,6 +216,97 @@ def test_guard_rechecks_route_after_in_turn_fallback(
     agent.client.chat.completions.create.assert_not_called()
 
 
+@pytest.mark.parametrize("provider", ["openai-codex", "xai-oauth"])
+def test_guarded_codex_responses_route_is_explicitly_supported(provider) -> None:
+    from hermes_cli.provider_request_guard import (
+        provider_request_guard_route_supported,
+    )
+
+    assert provider_request_guard_route_supported(
+        api_mode="codex_responses",
+        provider=provider,
+    ) is True
+
+
+def test_guarded_xai_codex_response_is_permitted_immediately_before_provider(
+    monkeypatch,
+) -> None:
+    from agent.chat_completion_helpers import _dispatch_nonstreaming_api_request
+    from hermes_cli import plugins
+    from hermes_cli.provider_request_guard import ProviderRequestAuthorization
+
+    events: list[str] = []
+    manager = plugins.PluginManager()
+    manager._provider_request_guard_required = True
+
+    def allow(**kwargs):
+        events.append("permit")
+        assert kwargs["provider"] == "xai-oauth"
+        assert kwargs["api_mode"] == "codex_responses"
+        assert kwargs["transport_mode"] == "non_streaming"
+        assert kwargs["model_tokens_requested"] == 73
+        return ProviderRequestAuthorization(
+            authorization_id="test-only-xai-codex-authorization",
+            request_sha256=kwargs["request_sha256"],
+            subject_sha256="sha256:" + "6" * 64,
+            expires_at_monotonic=time.monotonic() + 30,
+        )
+
+    manager._provider_request_guard = allow
+    monkeypatch.setattr(plugins, "_plugin_manager", manager)
+
+    class Responses:
+        @staticmethod
+        def create(**kwargs):
+            events.append("provider")
+            assert kwargs["model"] == "grok-4.6"
+            assert kwargs["max_output_tokens"] == 73
+            assert "stream" not in kwargs
+            return SimpleNamespace(id="response-1", output=[])
+
+    client = SimpleNamespace(
+        base_url="https://api.x.ai/v1/",
+        default_headers={
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Authorization": "Bearer test-only-key",
+        },
+        default_query={},
+        responses=Responses(),
+    )
+    target = SimpleNamespace(
+        api_mode="codex_responses",
+        provider="xai-oauth",
+        model="grok-4.6",
+        api_key="test-only-key",
+        base_url="https://api.x.ai/v1",
+        _provider_request_guard_context={
+            "task_id": "card-7",
+            "turn_id": "turn-1",
+            "api_request_id": "turn-1:api:1",
+            "session_id": "session-9",
+            "profile_id": "implementer",
+            "provider": "xai-oauth",
+            "model": "grok-4.6",
+            "api_mode": "codex_responses",
+            "api_call_count": 1,
+        },
+    )
+
+    result = _dispatch_nonstreaming_api_request(
+        target,
+        {
+            "model": "grok-4.6",
+            "input": "bounded",
+            "max_output_tokens": 73,
+        },
+        make_client=lambda _reason: client,
+    )
+
+    assert result.id == "response-1"
+    assert events == ["permit", "provider"]
+
+
 def test_guard_is_immediately_before_provider(agent, monkeypatch) -> None:
     from hermes_cli import plugins
     from hermes_cli.provider_request_guard import ProviderRequestAuthorization

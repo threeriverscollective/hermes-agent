@@ -1709,15 +1709,20 @@ def run_conversation(
         get_plugin_manager as _get_plugin_manager,
         provider_request_guard_required as _provider_guard_required,
     )
-    from hermes_cli.provider_request_guard import ProviderRequestBlocked
+    from hermes_cli.provider_request_guard import (
+        ProviderRequestBlocked,
+        provider_request_guard_route_supported,
+    )
 
     _provider_guard_is_required = _provider_guard_required()
     if _provider_guard_is_required:
         _manager = _get_plugin_manager()
         if (
             agent.compression_enabled
-            or agent.api_mode != "chat_completions"
-            or agent.provider == "moa"
+            or not provider_request_guard_route_supported(
+                api_mode=agent.api_mode,
+                provider=agent.provider,
+            )
             or env_var_enabled("HERMES_KANBAN_GOAL_MODE")
             or _manager.has_hook("pre_llm_call")
             or _manager.has_hook("pre_api_request")

@@ -59,6 +59,17 @@ class ProviderRequestGuardRegistrationError(PermissionError):
     """Raised when more than one plugin tries to own provider authorization."""
 
 
+def provider_request_guard_route_supported(*, api_mode: object, provider: object) -> bool:
+    """Return whether Hermes has one guarded, non-streaming provider route."""
+
+    return (
+        api_mode == "chat_completions" and provider != "moa"
+    ) or (
+        api_mode == "codex_responses"
+        and provider in {"openai-codex", "xai-oauth"}
+    )
+
+
 def bind_managed_task_id(task_id: object) -> object:
     """Bind one caller task identity to the exact host-managed task.
 
@@ -687,6 +698,7 @@ __all__ = [
     "ProviderRequestAuthorization",
     "ProviderRequestBlocked",
     "ProviderRequestGuardRegistrationError",
+    "provider_request_guard_route_supported",
     "ProviderToolInvocationAttestation",
     "bind_managed_task_id",
     "begin_provider_request_authorization",
