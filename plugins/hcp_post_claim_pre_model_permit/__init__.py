@@ -532,7 +532,7 @@ class HCPPermitGuard:
             or transport_mode != manifest["transport_mode"]
             or request.get("model") != model
             or type(api_call_count) is not int
-            or api_call_count < 0
+            or api_call_count <= 0
         ):
             raise ProviderRequestBlocked("HCP_PERMIT_IDENTITY_MISMATCH")
         for value in (turn_id, api_request_id, session_id):

@@ -121,7 +121,7 @@ def _context() -> dict[str, object]:
     return {
         "task_id": "card-7",
         "turn_id": "turn-1",
-        "api_request_id": "turn-1:api:0",
+        "api_request_id": "turn-1:api:1",
         "session_id": "session-9",
         "profile_id": "hcp-general-implementer",
         "provider": "openai",
@@ -130,7 +130,7 @@ def _context() -> dict[str, object]:
         "endpoint_origin": "https://example.invalid",
         "transport_identity_sha256": "sha256:" + "d" * 64,
         "transport_mode": "non_streaming",
-        "api_call_count": 0,
+        "api_call_count": 1,
         "model_tokens_requested": 31,
     }
 
@@ -490,14 +490,14 @@ def test_exact_hcp_exchanges_are_signed_and_each_attempt_gets_a_new_connection(
         "claim_lock_sha256": _digest_text("host:123"),
         "worker_pid": os.getpid(),
         "turn_id": "turn-1",
-        "api_request_id": "turn-1:api:0",
+        "api_request_id": "turn-1:api:1",
         "provider": "openai",
         "model": "test-model",
         "api_mode": "chat_completions",
         "endpoint_origin": "https://example.invalid",
         "transport_identity_sha256": "sha256:" + "d" * 64,
         "transport_mode": "non_streaming",
-        "api_call_count": 0,
+        "api_call_count": 1,
     }
     assert "test-only-key" not in json.dumps(observed)
 
@@ -507,7 +507,7 @@ def _response_binding(authorization) -> dict[str, object]:
         "task_id": "card-7",
         "session_id": "session-9",
         "turn_id": "turn-1",
-        "api_request_id": "turn-1:api:0",
+        "api_request_id": "turn-1:api:1",
         "authorization_id": authorization.authorization_id,
         "request_sha256": authorization.request_sha256,
         "subject_sha256": authorization.subject_sha256,
@@ -631,9 +631,12 @@ def test_denial_expiry_identity_and_signature_fail_closed(
         ("model", "other-model"),
         ("endpoint_origin", "https://other.invalid"),
         ("transport_mode", "streaming"),
+        ("api_call_count", 0),
     ],
 )
-def test_caller_identity_mismatch_never_contacts_hcp(field: str, value: str) -> None:
+def test_caller_identity_mismatch_never_contacts_hcp(
+    field: str, value: object
+) -> None:
     from hermes_cli.provider_request_guard import ProviderRequestBlocked
     from plugins.hcp_post_claim_pre_model_permit import HCPPermitGuard
 

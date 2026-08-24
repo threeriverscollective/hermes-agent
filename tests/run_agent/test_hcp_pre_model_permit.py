@@ -287,13 +287,13 @@ def test_authorization_expiry_is_rechecked_at_provider_transport(
     agent._provider_request_guard_context = {
         "task_id": "card-7",
         "turn_id": "turn-1",
-        "api_request_id": "turn-1:api:0",
+        "api_request_id": "turn-1:api:1",
         "session_id": "session-9",
         "profile_id": "hcp-general-implementer",
         "provider": "openai",
         "model": "test-model",
         "api_mode": "chat_completions",
-        "api_call_count": 0,
+        "api_call_count": 1,
     }
 
     def make_client(_reason):
@@ -345,13 +345,13 @@ def test_guard_refuses_unbound_client_transport_state(
     agent._provider_request_guard_context = {
         "task_id": "card-7",
         "turn_id": "turn-1",
-        "api_request_id": "turn-1:api:0",
+        "api_request_id": "turn-1:api:1",
         "session_id": "session-9",
         "profile_id": "hcp-general-implementer",
         "provider": "openai",
         "model": "test-model",
         "api_mode": "chat_completions",
-        "api_call_count": 0,
+        "api_call_count": 1,
     }
 
     with pytest.raises(ProviderRequestBlocked, match=error):
@@ -498,13 +498,13 @@ def test_guard_receives_the_exact_final_model_payload(monkeypatch) -> None:
         _provider_request_guard_context={
             "task_id": "card-7",
             "turn_id": "turn-1",
-            "api_request_id": "turn-1:api:0",
+            "api_request_id": "turn-1:api:1",
             "session_id": "session-9",
             "profile_id": "hcp-general-implementer",
             "provider": "openai",
             "model": "test-model",
             "api_mode": "chat_completions",
-            "api_call_count": 0,
+            "api_call_count": 1,
         },
     )
     payload = {
@@ -548,13 +548,13 @@ def test_guard_rejects_unbound_request_transport_controls(
     agent._provider_request_guard_context = {
         "task_id": "card-7",
         "turn_id": "turn-1",
-        "api_request_id": "turn-1:api:0",
+        "api_request_id": "turn-1:api:1",
         "session_id": "session-9",
         "profile_id": "hcp-general-implementer",
         "provider": "openai",
         "model": "test-model",
         "api_mode": "chat_completions",
-        "api_call_count": 0,
+        "api_call_count": 1,
     }
     payload = {
         "model": "test-model",
@@ -632,13 +632,13 @@ def test_guard_binds_sdk_extra_body_to_the_actual_http_body(monkeypatch) -> None
         _provider_request_guard_context={
             "task_id": "card-7",
             "turn_id": "turn-1",
-            "api_request_id": "turn-1:api:0",
+            "api_request_id": "turn-1:api:1",
             "session_id": "session-9",
             "profile_id": "hcp-general-implementer",
             "provider": "openai",
             "model": "test-model",
             "api_mode": "chat_completions",
-            "api_call_count": 0,
+            "api_call_count": 1,
         },
     )
     payload = {
@@ -678,13 +678,13 @@ def test_guard_rejects_a_request_without_an_output_token_ceiling(
     agent._provider_request_guard_context = {
         "task_id": "card-7",
         "turn_id": "turn-1",
-        "api_request_id": "turn-1:api:0",
+        "api_request_id": "turn-1:api:1",
         "session_id": "session-9",
         "profile_id": "hcp-general-implementer",
         "provider": "openai",
         "model": "test-model",
         "api_mode": "chat_completions",
-        "api_call_count": 0,
+        "api_call_count": 1,
     }
 
     with pytest.raises(ProviderRequestBlocked, match="MODEL_BUDGET_UNBOUNDED"):
@@ -760,13 +760,13 @@ def test_guard_cannot_mutate_the_authorized_request_before_transport(
         _provider_request_guard_context={
             "task_id": "card-7",
             "turn_id": "turn-1",
-            "api_request_id": "turn-1:api:0",
+            "api_request_id": "turn-1:api:1",
             "session_id": "session-9",
             "profile_id": "hcp-general-implementer",
             "provider": "openai",
             "model": "test-model",
             "api_mode": "chat_completions",
-            "api_call_count": 0,
+            "api_call_count": 1,
         },
     )
     payload = {
