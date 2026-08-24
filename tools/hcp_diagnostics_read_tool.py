@@ -151,7 +151,9 @@ def _token(value: object) -> str:
     return value
 
 
-def _read_owner_file(path_value: object) -> tuple[Path, bytes]:
+def _read_owner_file(
+    path_value: object, *, allowed_modes: frozenset[int] = frozenset({0o600})
+) -> tuple[Path, bytes]:
     if type(path_value) is not str:
         raise HcpDiagnosticsToolRefusal("BROKER_TRANSPORT_AUTH_INVALID")
     path = Path(path_value)
@@ -175,7 +177,7 @@ def _read_owner_file(path_value: object) -> tuple[Path, bytes]:
     if (
         not stat.S_ISREG(metadata.st_mode)
         or metadata.st_uid != os.geteuid()
-        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or stat.S_IMODE(metadata.st_mode) not in allowed_modes
         or len(payload) > _MAX_REQUEST_BYTES
     ):
         raise HcpDiagnosticsToolRefusal("BROKER_TRANSPORT_AUTH_INVALID")
@@ -185,7 +187,9 @@ def _read_owner_file(path_value: object) -> tuple[Path, bytes]:
 def _read_private_file(path_value: object, expected_digest: object) -> bytes:
     if type(expected_digest) is not str or _SHA256.fullmatch(expected_digest) is None:
         raise HcpDiagnosticsToolRefusal("BROKER_TRANSPORT_AUTH_INVALID")
-    _, payload = _read_owner_file(path_value)
+    _, payload = _read_owner_file(
+        path_value, allowed_modes=frozenset({0o400, 0o600})
+    )
     if "sha256:" + hashlib.sha256(payload).hexdigest() != expected_digest:
         raise HcpDiagnosticsToolRefusal("BROKER_TRANSPORT_AUTH_INVALID")
     return payload

@@ -261,6 +261,7 @@ def test_dispatcher_owned_keys_may_be_outside_runtime_root(
         source = Path(config[field]["key_path"])
         target = dispatcher_root / filename
         source.replace(target)
+        target.chmod(0o400)
         config[field]["key_path"] = str(target)
     _write_private(config_path, _canonical(config))
     monkeypatch.setenv("HCP_DIAGNOSTICS_TOOL_CONFIG", str(config_path))
