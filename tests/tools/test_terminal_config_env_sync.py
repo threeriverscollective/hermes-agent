@@ -182,6 +182,7 @@ def test_save_config_set_supports_critical_bridged_keys():
         "container_memory",
         "container_disk",
         "container_persistent",
+        "docker_require_resource_limits",
     }
     missing = required - save_keys
     assert not missing, (
@@ -204,6 +205,14 @@ def test_docker_run_as_host_user_is_bridged_everywhere():
     assert "docker_run_as_host_user" in _gateway_env_map_keys()
     assert "docker_run_as_host_user" in _save_config_env_sync_keys()
     assert "TERMINAL_DOCKER_RUN_AS_HOST_USER" in _terminal_tool_env_var_names()
+
+
+def test_docker_require_resource_limits_is_bridged_everywhere():
+    """Required resource-limit mode reaches every terminal entry point."""
+    assert "docker_require_resource_limits" in _cli_env_map_keys()
+    assert "docker_require_resource_limits" in _gateway_env_map_keys()
+    assert "docker_require_resource_limits" in _save_config_env_sync_keys()
+    assert "TERMINAL_DOCKER_REQUIRE_RESOURCE_LIMITS" in _terminal_tool_env_var_names()
 
 
 def test_docker_mount_cwd_to_workspace_is_bridged_everywhere():

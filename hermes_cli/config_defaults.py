@@ -406,6 +406,10 @@ DEFAULT_CONFIG = {
         # Opt-in egress lockdown for Docker terminal sessions. When false,
         # Docker runs with --network=none so commands cannot reach the network.
         "docker_network": True,
+        # Require Docker to enforce CPU, memory, and PID limits on the real
+        # worker container.  When false, the Docker backend retains its
+        # cached capability probe and graceful-degradation behavior.
+        "docker_require_resource_limits": False,
         "docker_extra_args": [],        # Extra flags passed verbatim to docker run
         # /dev/shm size for the Docker sandbox. Docker's 64 MB default silently
         # breaks Chromium/Playwright and PyTorch DataLoader workers; tmpfs is

@@ -1679,6 +1679,9 @@ def _get_env_config() -> Dict[str, Any]:
         "docker_volumes": docker_volumes,
         "docker_env": docker_env,
         "docker_run_as_host_user": os.getenv("TERMINAL_DOCKER_RUN_AS_HOST_USER", "false").lower() in {"true", "1", "yes"},
+        "docker_require_resource_limits": os.getenv(
+            "TERMINAL_DOCKER_REQUIRE_RESOURCE_LIMITS", "false"
+        ).lower() in {"true", "1", "yes"},
         "docker_network": os.getenv("TERMINAL_DOCKER_NETWORK", "true").lower() in {"true", "1", "yes"},
         "docker_extra_args": docker_extra_args,
         "docker_shm_size": docker_shm_size,
@@ -1744,6 +1747,7 @@ def _container_config_from_config(config: Dict[str, Any]) -> dict:
         "docker_forward_env": config.get("docker_forward_env", []),
         "docker_env": config.get("docker_env", {}),
         "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
+        "docker_require_resource_limits": config.get("docker_require_resource_limits", False),
         "docker_extra_args": config.get("docker_extra_args", []),
         "docker_shm_size": config.get("docker_shm_size", "1g"),
         "docker_network": config.get("docker_network", True),
@@ -1784,6 +1788,7 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
     docker_env = cc.get("docker_env", {})
     docker_extra_args = cc.get("docker_extra_args", [])
     docker_network = cc.get("docker_network", True)
+    docker_require_resource_limits = cc.get("docker_require_resource_limits", False)
 
     if env_type == "local":
         return _LocalEnvironment(cwd=cwd, timeout=timeout)
@@ -1817,6 +1822,7 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             forward_env=docker_forward_env,
             env=docker_env,
             run_as_host_user=cc.get("docker_run_as_host_user", False),
+            docker_require_resource_limits=docker_require_resource_limits,
             network=docker_network,
             extra_args=docker_extra_args,
             persist_across_processes=(

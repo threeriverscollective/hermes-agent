@@ -885,6 +885,7 @@ class DockerEnvironment(BaseEnvironment):
         host_cwd: Optional[str] = None,
         auto_mount_cwd: bool = False,
         run_as_host_user: bool = False,
+        docker_require_resource_limits: bool = False,
         extra_args: list = None,
         persist_across_processes: bool = True,
         shm_size: str = _DEFAULT_SHM_SIZE,
@@ -917,17 +918,26 @@ class DockerEnvironment(BaseEnvironment):
         # Fail fast if Docker is not available.
         _ensure_docker_available()
 
-        # Build resource limit args (gated by cgroup availability probe so
-        # they degrade gracefully on hosts without controller delegation,
-        # e.g. unprivileged LXCs). The probe runs once per process and is
-        # cached host-wide.
+        # Build resource limit args. Generic Hermes keeps the historical
+        # cached capability probe and graceful degradation. HCP-required
+        # profiles opt into fail-closed behavior: the probe is skipped and
+        # the limits are placed directly on the one real worker run, so a
+        # daemon refusal propagates from that create/start with no fallback.
         resource_args = []
-        if cpu > 0 and _cgroup_limits_available(image):
-            resource_args.extend(["--cpus", str(cpu)])
-        if memory > 0 and _cgroup_limits_available(image):
-            resource_args.extend(["--memory", f"{memory}m"])
-        if _cgroup_limits_available(image):
+        if docker_require_resource_limits:
+            if cpu > 0:
+                resource_args.extend(["--cpus", str(cpu)])
+            if memory > 0:
+                resource_args.extend(["--memory", f"{memory}m"])
             resource_args.extend(["--pids-limit", _DEFAULT_PIDS_LIMIT])
+        else:
+            limits_available = _cgroup_limits_available(image)
+            if cpu > 0 and limits_available:
+                resource_args.extend(["--cpus", str(cpu)])
+            if memory > 0 and limits_available:
+                resource_args.extend(["--memory", f"{memory}m"])
+            if limits_available:
+                resource_args.extend(["--pids-limit", _DEFAULT_PIDS_LIMIT])
         # /dev/shm size (not cgroup-gated: --shm-size is a tmpfs mount option,
         # no controller delegation required). Skip when the user already sets
         # it via docker_extra_args, or opted out with an empty/"0" value.

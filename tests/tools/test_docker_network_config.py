@@ -18,6 +18,14 @@ def test_terminal_env_config_reads_docker_network_toggle(monkeypatch):
     assert config["docker_network"] is False
 
 
+def test_terminal_env_config_defaults_required_resource_limits_to_false(monkeypatch):
+    monkeypatch.delenv("TERMINAL_DOCKER_REQUIRE_RESOURCE_LIMITS", raising=False)
+
+    config = terminal_tool._get_env_config()
+
+    assert config["docker_require_resource_limits"] is False
+
+
 def test_cgroup_capability_probe_is_always_airgapped(monkeypatch):
     commands = []
 
@@ -99,6 +107,45 @@ def test_sibling_container_config_sites_carry_docker_network():
                     f"(line {node.lineno})"
                 )
         assert sites >= 1, f"expected at least one container_config site in {module.__name__}"
+
+
+def test_sibling_container_config_sites_carry_required_resource_limits():
+    """Every hand-built container config must preserve required-mode policy."""
+    import ast
+    import inspect
+
+    import agent.prompt_builder as prompt_builder
+    import tools.code_execution_tool as code_execution_tool
+    import tools.file_tools as file_tools
+
+    for module in (
+        terminal_tool,
+        file_tools,
+        code_execution_tool,
+        prompt_builder,
+    ):
+        tree = ast.parse(inspect.getsource(module))
+        sites = 0
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Dict):
+                continue
+            keys = {k.value for k in node.keys if isinstance(k, ast.Constant)}
+            if "docker_run_as_host_user" in keys:
+                sites += 1
+                assert "docker_require_resource_limits" in keys, (
+                    f"{module.__name__} builds a container_config with "
+                    f"docker_run_as_host_user but without "
+                    f"docker_require_resource_limits (line {node.lineno})"
+                )
+        assert sites >= 1, f"expected at least one container_config site in {module.__name__}"
+
+
+def test_container_config_helper_preserves_required_resource_limits():
+    config = terminal_tool._container_config_from_config(
+        {"docker_require_resource_limits": True}
+    )
+
+    assert config["docker_require_resource_limits"] is True
 
 
 def _reuse_guard_harness(monkeypatch, *, existing_mode: str, network: bool):
