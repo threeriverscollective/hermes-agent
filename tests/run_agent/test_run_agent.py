@@ -2770,6 +2770,89 @@ class TestRunConversation:
         coordinator.release_conversation.assert_called_once_with(relay_lease)
         assert agent._relay_pending_turn_id is None
 
+    def test_quiet_kanban_forwarder_uses_dispatcher_card_identity(self, agent, monkeypatch):
+        """The quiet dispatcher omits task_id; preserve its inherited card scope.
+
+        Provider-response attestation and HCP tool execution must use the same
+        dispatcher-selected identity.  A fresh UUID here would make the live
+        kanban path fail closed at the tool boundary even though both halves
+        were individually valid.
+        """
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "card-7")
+        relay_lease = SimpleNamespace(
+            parent_session_id="",
+            profile_key="/profile",
+            session_id=agent.session_id or "",
+        )
+        relay_turn = object()
+        coordinator = MagicMock()
+        coordinator.acquire_conversation.return_value = relay_lease
+        coordinator.begin_turn.return_value = relay_turn
+        result = {"final_response": "held", "completed": False, "failed": True}
+
+        with (
+            patch("agent.relay_runtime.SESSION_COORDINATOR", coordinator),
+            patch(
+                "agent.relay_runtime.current_profile_key",
+                return_value="/profile",
+            ),
+            patch(
+                "hermes_cli.observability.relay_shared_metrics.start_task_run"
+            ),
+            patch(
+                "hermes_cli.observability.relay_shared_metrics.finish_task_run"
+            ),
+            patch(
+                "agent.conversation_loop.run_conversation",
+                return_value=result,
+            ) as run_conversation,
+        ):
+            observed = agent.run_conversation("kanban work")
+
+        assert observed is result
+        assert run_conversation.call_args.args[4] == "card-7"
+
+    def test_quiet_kanban_forwarder_rejects_conflicting_task_identity(
+        self, agent, monkeypatch
+    ):
+        """A caller cannot replace the dispatcher's managed card scope."""
+        from hermes_cli.provider_request_guard import ProviderRequestBlocked
+
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "card-7")
+        with pytest.raises(ProviderRequestBlocked) as caught:
+            agent.run_conversation("kanban work", task_id="caller-task")
+
+        assert caught.value.error_code == "PROVIDER_TASK_ID_MISMATCH"
+
+    def test_conversation_loop_rejects_conflicting_task_identity(
+        self, agent, monkeypatch
+    ):
+        """The lower conversation path enforces the same identity boundary."""
+        from agent.conversation_loop import run_conversation
+        from hermes_cli.provider_request_guard import ProviderRequestBlocked
+
+        self._setup_agent(agent)
+        agent.api_mode = "chat_completions"
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "card-7")
+        manager = SimpleNamespace(
+            has_hook=lambda _name: False,
+            has_middleware=lambda _name: False,
+        )
+        with (
+            patch(
+                "hermes_cli.plugins.provider_request_guard_required",
+                return_value=True,
+            ),
+            patch("hermes_cli.plugins.get_plugin_manager", return_value=manager),
+            patch.object(agent, "_try_refresh_env_client_credentials"),
+            patch("agent.conversation_loop.build_turn_context") as build_context,
+        ):
+            with pytest.raises(ProviderRequestBlocked) as caught:
+                run_conversation(agent, "kanban work", task_id="caller-task")
+
+        assert caught.value.error_code == "PROVIDER_TASK_ID_MISMATCH"
+        build_context.assert_not_called()
+
     def test_stop_finish_reason_returns_response(self, agent):
         self._setup_agent(agent)
         resp = _mock_response(content="Final answer", finish_reason="stop")

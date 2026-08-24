@@ -1711,7 +1711,8 @@ def run_conversation(
     )
     from hermes_cli.provider_request_guard import ProviderRequestBlocked
 
-    if _provider_guard_required():
+    _provider_guard_is_required = _provider_guard_required()
+    if _provider_guard_is_required:
         _manager = _get_plugin_manager()
         if (
             agent.compression_enabled
@@ -1724,6 +1725,22 @@ def run_conversation(
             or _manager.has_middleware("llm_execution")
         ):
             raise ProviderRequestBlocked("PROVIDER_REQUEST_GUARD_ROUTE_UNSUPPORTED")
+
+
+    # The dispatcher selects the managed card identity and inherits it as
+    # HERMES_KANBAN_TASK.  Direct callers can omit task_id (the quiet kanban
+    # path does), but they may not replace or contradict that authority.
+    # Resolve it before build_turn_context so the same value reaches both
+    # provider-response binding and tool consumption, regardless of whether a
+    # guard has already been registered or is required for this process.
+    _managed_task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
+    if _managed_task_id:
+        if task_id is not None and str(task_id).strip() not in {
+            "",
+            _managed_task_id,
+        }:
+            raise ProviderRequestBlocked("PROVIDER_TASK_ID_MISMATCH")
+        task_id = _managed_task_id
 
     # ── Per-turn setup (the prologue) ──
     # All once-per-turn setup — stdio guarding, retry-counter resets, user

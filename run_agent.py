@@ -8318,6 +8318,23 @@ class AIAgent:
             start_task_run,
         )
         from agent.subagent_lifecycle import bind_subagent_parent
+        # A dispatcher-spawned kanban worker receives its task identity through
+        # the inherited environment.  The quiet kanban caller intentionally
+        # omits ``task_id`` when it enters this facade, so generating a fresh
+        # UUID here would split the provider-response attestation (bound to the
+        # card identity) from the tool execution (scoped to this UUID).  Treat
+        # the dispatcher-selected card as authoritative and reject a conflicting
+        # caller value rather than letting a caller or model choose the scope.
+        managed_task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
+        if managed_task_id:
+            if task_id is not None and str(task_id).strip() not in {
+                "",
+                managed_task_id,
+            }:
+                from hermes_cli.provider_request_guard import ProviderRequestBlocked
+
+                raise ProviderRequestBlocked("PROVIDER_TASK_ID_MISMATCH")
+            task_id = managed_task_id
         effective_task_id = task_id or str(uuid.uuid4())
         session_id = str(getattr(self, "session_id", None) or "")
         task_context = {

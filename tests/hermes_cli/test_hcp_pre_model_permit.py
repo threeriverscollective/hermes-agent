@@ -881,6 +881,7 @@ def test_profile_dotenv_cannot_clear_or_replace_managed_worker_identity(
         "HERMES_KANBAN_BOARD": "hcp-board",
         "HERMES_KANBAN_DB": "/private/board.db",
         "HERMES_PROFILE": "hcp-general-implementer",
+        "TERMINAL_DOCKER_REQUIRE_RESOURCE_LIMITS": "1",
     }
     for key, value in original.items():
         monkeypatch.setenv(key, value)
