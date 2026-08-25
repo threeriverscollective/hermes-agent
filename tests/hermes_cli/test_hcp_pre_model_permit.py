@@ -135,6 +135,16 @@ def _context() -> dict[str, object]:
     }
 
 
+def test_permit_channel_default_covers_two_current_authority_reads() -> None:
+    from plugins.hcp_post_claim_pre_model_permit.channel import (
+        UnixSocketPermitTransport,
+    )
+
+    transport = UnixSocketPermitTransport("/private/tmp/hcp-permit-test.sock")
+
+    assert transport._deadline_seconds == 30.0
+
+
 class SignedPermitServer:
     """Test-only wire peer that models the accepted HCP PermitServer calls."""
 

@@ -15,7 +15,11 @@ from hermes_cli.provider_request_guard import ProviderRequestBlocked
 
 
 _FRAME_LIMIT = 2 * 1024 * 1024
-_DEADLINE_SECONDS = 5.0
+# One permit exchange performs two current-authority reads (issuance and the
+# immediately-before-model verification) before HCP can answer.  Keep the
+# complete exchange inside the existing bounded 30-second channel ceiling;
+# five seconds incorrectly parked otherwise valid workers on slower hosts.
+_DEADLINE_SECONDS = 30.0
 
 
 def canonical_json(value: object) -> bytes:
